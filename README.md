@@ -7,6 +7,7 @@ For Ally/ASUS devices, it uses WMI Platform Profiles for fans + turns on MCU pow
 **See releases page for installation instructions!**
 
 ##Showcase
+
 https://youtu.be/zKW589sK05g
 
 ## Features
