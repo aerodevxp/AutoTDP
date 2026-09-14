@@ -1147,9 +1147,11 @@ monitor_and_adjust() {
         if is_on_external_power; then
             new_power_state=1
             ceiling=$ACTIVE_MAX_TDP
+            echo 1 | sudo tee /sys/devices/system/cpu/cpufreq/boost
         else
             new_power_state=0
             ceiling=$ACTIVE_BATTERY_MAX_TDP
+            echo 0 | sudo tee /sys/devices/system/cpu/cpufreq/boost
         fi
         if (( new_power_state != power_state )); then
             if (( new_power_state == 1 )); then
