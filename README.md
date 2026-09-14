@@ -6,6 +6,9 @@ For Ally/ASUS devices, it uses WMI Platform Profiles for fans + turns on MCU pow
 
 **See releases page for installation instructions!**
 
+##Showcase
+https://youtu.be/zKW589sK05g
+
 ## Features
 
 - Uses both CPU AND/OR GPU utilization for both CPU-bound and GPU-bound games
