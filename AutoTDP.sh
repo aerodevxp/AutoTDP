@@ -13,6 +13,8 @@ GAME_PROFILES_SOURCE_FILE="$SCRIPT_DIR/game_profiles.json"
 LOG_DIR="$CONFIG_DIR/logs"
 LOG_FILE="$LOG_DIR/tdp_manager_$(date +'%Y-%m-%d_%H-%M-%S').log"  # New log file per run
 REQUIRED_PACKAGES=("jq" "sudo" "ryzenadj")
+CONFIG_LAUNCHER="/usr/local/bin/autotdp-configui"
+DESKTOP_FILE="/usr/share/applications/autotdp-config.desktop"
 
 # Global variables
 MIN_TDP=5000
@@ -34,6 +36,7 @@ CLI_PROFILE_OVERRIDE=""
 CLI_MODE_OVERRIDE=""
 PERSIST_PROFILE=0
 PERSIST_MODE=0
+TEST_MODE=0
 ACTION="run"
 EXIT_STATUS=0
 MONITOR_PID=0
@@ -93,6 +96,7 @@ Usage: $0 [options]
 
 Options:
   --install                 Install AutoTDP as a systemd service
+  --configui                  UI to setup the configuration located at \"$CONFIG_FILE\"
   --update                  Check for and install script updates from the aerodevxp repo
   --mode <name>             Run with a temporary mode override
   --set-mode <name>         Persist the selected mode to the config file
@@ -103,6 +107,7 @@ Options:
   --list-profiles           Print available device profiles
   -- <command ...>          Run a game or app while AutoTDP monitors it
   --help                    Show this help message
+  --test                    For Debugging purposes
 EOF
 }
 
@@ -119,6 +124,9 @@ parse_arguments() {
                 ;;
             --update)
                 ACTION="update"
+                ;;
+            --configui)
+                ACTION="configui"
                 ;;
             --mode)
                 CLI_MODE_OVERRIDE=${2:-}
@@ -172,6 +180,9 @@ parse_arguments() {
                 ;;
             --help)
                 ACTION="help"
+                ;;
+            --test)
+                TEST_MODE=1
                 ;;
             *)
                 echo "Unknown option: $1" >&2
@@ -723,7 +734,7 @@ set_config_value() {
     fi
 
     run_privileged install -m 0644 "$temp_file" "$CONFIG_FILE"
-    rm -f "$temp_file"
+    run_privileged rm -f "$temp_file"
 }
 
 restart_service_if_running() {
@@ -733,6 +744,54 @@ restart_service_if_running() {
             log "Restarted autotdp.service to apply updated configuration"
         fi
     fi
+}
+
+install_desktop_shortcut() {
+    # Launcher script: password first, update, then UI
+    run_privileged tee "$CONFIG_LAUNCHER" > /dev/null <<'EOF'
+#!/bin/bash
+# AutoTDP config launcher: update, then open the configuration UI
+SELF=/usr/local/bin/autotdp.sh
+
+# Ask for the sudo password up front so everything after runs unattended
+if [[ $EUID -ne 0 ]]; then
+    sudo -v || { echo "sudo authentication required to configure AutoTDP"; exit 1; }
+fi
+
+# Self-update (validates the download before installing; safe to run every time)
+sudo "$SELF" --update
+
+# Launch the config UI (reuses the cached sudo credential)
+exec sudo "$SELF" --configui
+EOF
+    run_privileged chmod 0755 "$CONFIG_LAUNCHER"
+
+    # Desktop entry — Terminal=true makes the DE open it in a terminal,
+    # which whiptail needs, and gives sudo a place to prompt
+    run_privileged tee "$DESKTOP_FILE" > /dev/null <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=AutoTDP Configuration
+Comment=Update AutoTDP and edit its configuration
+Exec=/usr/local/bin/autotdp-configui
+Icon=preferences-system-power
+Terminal=true
+Categories=System;Settings;
+Keywords=tdp;power;handheld;autotdp;
+EOF
+    run_privileged chmod 0644 "$DESKTOP_FILE"
+
+    # Best-effort copy onto the invoking user's actual Desktop, if one exists
+    if [[ -n "${SUDO_USER:-}" ]]; then
+        local user_desktop
+        user_desktop=$(getent passwd "$SUDO_USER" | cut -d: -f6)/Desktop
+        if [[ -d "$user_desktop" ]]; then
+            run_privileged install -m 0644 -o "$SUDO_USER" -g "$(id -gn "$SUDO_USER")" \
+                "$DESKTOP_FILE" "$user_desktop/autotdp-config.desktop"
+        fi
+    fi
+
+    log "Desktop shortcut installed: $DESKTOP_FILE"
 }
 
 read_env_value_from_pid() {
@@ -1334,7 +1393,7 @@ EOF
     run_privileged systemctl daemon-reload
     run_privileged systemctl enable autotdp.service
     run_privileged systemctl restart autotdp.service
-
+    install_desktop_shortcut
     log "AutoTDP service installed and started"
 }
 
@@ -1391,6 +1450,277 @@ perform_self_update() {
     return 0
 }
 
+UI="plain"
+if [[ -n "${DISPLAY:-}" || -n "${WAYLAND_DISPLAY:-}" ]]; then
+    if command -v zenity >/dev/null 2>&1; then
+        UI="zenity"
+    elif command -v kdialog >/dev/null 2>&1; then
+        UI="kdialog"
+    fi
+fi
+[ "$UI" = "plain" ] && command -v whiptail >/dev/null 2>&1 && UI="whiptail"
+[ "$UI" = "plain" ] && command -v dialog   >/dev/null 2>&1 && UI="dialog"
+
+ui_msg() {
+    case "$UI" in
+        zenity)  zenity --info --title="$1" --text="$2" --width=400 ;;
+        kdialog) kdialog --title "$1" --msgbox "$2" ;;
+        whiptail) whiptail --title "$1" --msgbox "$2" 12 65 ;;
+        dialog)  dialog --title "$1" --msgbox "$2" 12 65 ;;
+        *) echo "=== $1 ==="; echo "$2"; read -rp "Press Enter..." ;;
+    esac
+}
+
+ui_yesno() {
+    case "$UI" in
+        zenity)  zenity --question --title="$1" --text="$2" --width=400 2>/dev/null ;;
+        kdialog) kdialog --title "$1" --yesno "$2" ;;
+        whiptail) whiptail --title "$1" --yesno "$2" 10 60 ;;
+        dialog)  dialog --title "$1" --yesno "$2" 10 60 ;;
+        *) local a; read -rp "$2 [y/N]: " a; [[ "$a" =~ ^[Yy] ]] ;;
+    esac
+}
+
+ui_input() {
+    local title="$1" current="$2" val
+    case "$UI" in
+        zenity)  zenity --entry --title="$title" --text="Current value: $current" --entry-text="$current" 2>/dev/null ;;
+        kdialog) kdialog --title "$title" --inputbox "Current value: $current" "$current" ;;
+        whiptail) whiptail --title "$title" --inputbox "Current value: $current" 10 60 "$current" 3>&1 1>&2 2>&3 ;;
+        dialog)  dialog --title "$title" --inputbox "Current value: $current" 10 60 "$current" 3>&1 1>&2 2>&3 ;;
+        *) read -rp "$title [$current]: " val; echo "${val:-$current}" ;;
+    esac
+}
+
+
+ui_menu() {
+    local title="$1"; shift
+    case "$UI" in
+       zenity)
+            local tags=() values=()
+            while [ $# -gt 0 ]; do tags+=("$1"); values+=("$2"); shift 2; done
+            local lines=""
+            for i in "${!values[@]}"; do
+                lines+="$((i+1))) ${values[$i]}"$'\n'
+            done
+            local result
+            result=$(printf '%s' "$lines" | zenity --list --title="$title" \
+                  --column="Option" \
+                  --hide-header --height=600 2>/dev/null)
+            [ $? -ne 0 ] && return 1
+            [ -z "$result" ] && return 1
+            # Extract the number from "N) description"
+            local num="${result%%)*}"
+            num="${num// /}"
+            [ -n "$num" ] && echo "${tags[$((num-1))]}"
+            ;;
+        kdialog)
+            local args=()
+            while [ $# -gt 0 ]; do args+=("$1" "$2"); shift 2; done
+            kdialog --title "$title" --menu "Select:" "${args[@]}"
+            ;;
+        whiptail)
+            local args=()
+            while [ $# -gt 0 ]; do args+=("$1" "$2"); shift 2; done
+            whiptail --title "$title" --menu "Select:" 22 65 14 "${args[@]}" 3>&1 1>&2 2>&3
+            ;;
+        dialog)
+            local args=()
+            while [ $# -gt 0 ]; do args+=("$1" "$2"); shift 2; done
+            dialog --title "$title" --menu "Select:" 22 65 14 "${args[@]}" 3>&1 1>&2 2>&3
+            ;;
+        *)
+            local tags=() i=1
+            while [ $# -gt 0 ]; do echo "  $i) $1  ($2)" >&2; tags+=("$1"); shift 2; done
+            local n; read -rp "Choice: " n
+            [ -n "$n" ] && echo "${tags[$((n-1))]}"
+            ;;
+    esac
+}
+
+get_key() { grep -E "^${1}=" "$CONFIG_FILE" | head -1 | cut -d= -f2-; }
+
+set_key() { set_config_value "$1" "$2"; }
+
+edit_tdp() { # $1=key $2=label $3=min_allowed $4=max_allowed
+    local key="$1" label="$2" lo="$3" hi="$4" new
+    new=$(ui_input "$label" "$(get_key "$key")") || return
+    if [[ "$new" =~ ^[0-9]+$ ]] && [ "$new" -ge "$lo" ] && [ "$new" -le "$hi" ]; then
+        set_key "$key" "$new"
+    else
+        ui_msg "Invalid" "'$new' is not valid. Must be an integer between $lo and $hi (mW)."
+    fi
+}
+
+profile_active() { [ -n "$(get_key DEVICE_PROFILE)" ]; }
+
+# --- Device profile editor ---
+edit_device_profile() {
+    local current profiles_file
+    current=$(get_key DEVICE_PROFILE)
+    profiles_file=$(get_key DEVICE_PROFILE_FILE)
+
+    local json_data
+    json_data=$(jq -r '.profiles | to_entries[] |
+        [.key, (.value.display_name // .key), (.value.supported // false)] |
+        @tsv' "$profiles_file" 2>/dev/null) || json_data=""
+
+    if [ -z "$json_data" ]; then
+        ui_msg "Error" "Could not read profiles from $profiles_file.\nIs jq installed and is the JSON valid?"
+        return
+    fi
+
+    if ! ui_yesno "Device Profile" \
+        "Device profile is currently: ${current:-OFF}\n\nEnable a device profile?"; then
+        set_key DEVICE_PROFILE ""
+        return
+    fi
+
+    # Sort: supported first, unsupported at bottom with a marker
+    local pair=() key name supported
+    while IFS=$'\t' read -r key name supported; do
+        [ "$supported" = "true" ] && pair+=("$key" "$name") \
+                                  || pair+=("$key" "[UNSUPPORTED] $name")
+    done <<< "$json_data"
+
+    # Build radiolist args with current selection marked ON
+    local args=() i=0
+    while [ $i -lt ${#pair[@]} ]; do
+        [ "${pair[$i]}" = "$current" ] && args+=("${pair[$i]}" "${pair[$((i+1))]}" "ON") \
+                                       || args+=("${pair[$i]}" "${pair[$((i+1))]}" "OFF")
+        ((i+=2))
+    done
+
+    local selected=""
+    if [ "$UI" = "whiptail" ]; then
+        selected=$(whiptail --title "Device Profile" --radiolist \
+            "Select device (space to select, empty = disable):" \
+            24 70 16 "${args[@]}" 3>&1 1>&2 2>&3) || return
+    elif [ "$UI" = "dialog" ]; then
+        selected=$(dialog --title "Device Profile" --radiolist \
+            "Select device (space to select, empty = disable):" \
+            24 70 16 "${args[@]}" 3>&1 1>&2 2>&3) || return
+    else
+        local keys=() n idx=1
+        i=0
+        while [ $i -lt ${#pair[@]} ]; do
+            echo "  $idx) ${pair[$i]} - ${pair[$((i+1))]}"
+            keys+=("${pair[$i]}")
+            ((i+=2))
+            ((idx+=1))
+        done
+        read -rp "Choice (empty = keep ${current:-OFF}): " n
+        [ -n "$n" ] && selected="${keys[$((n-1))]}"
+    fi
+
+    # Empty selection = deselected = disable profile
+    # This brings up an error ??
+    if [ -z "$selected" ]; then
+        set_key DEVICE_PROFILE ""
+        return
+    fi
+
+    # Block unsupported profiles, showing the reason from the JSON
+    local reason
+    reason=$(jq -r --arg p "$selected" \
+        '.profiles[$p].unsupported_reason // empty' "$profiles_file")
+    if [ -n "$reason" ]; then
+        ui_msg "Unsupported Device" "$reason"
+        return
+    fi
+
+    set_key DEVICE_PROFILE "$selected"
+}
+
+# --- Performance mode editor ---
+edit_perf_mode() {
+    local current choice
+    current=$(get_key PERFORMANCE_MODE)
+    choice=$(ui_menu "Performance Mode" \
+        "silent"      "$([ "$current" = silent ] && echo SELECTED || echo "")" \
+        "battery"     "$([ "$current" = battery ] && echo SELECTED || echo "")" \
+        "balanced"    "$([ "$current" = balanced ] && echo SELECTED || echo "")" \
+        "performance" "$([ "$current" = performance ] && echo SELECTED || echo "")" \
+        "turbo"       "$([ "$current" = turbo ] && echo SELECTED || echo "")") || return
+    [ -n "$choice" ] && set_key PERFORMANCE_MODE "$choice"
+}
+
+# --- Advanced settings (warning first) ---
+advanced_settings() {
+    ui_msg "WARNING - Advanced Settings" \
+        "The following settings control internal timing, sampling, and executable paths.\n\nIf you don't know what a setting means, DO NOT CHANGE IT. Incorrect values can cause TDP oscillation, delayed responses, or ryzenadj failures." \
+    || return
+
+    while true; do
+        local choice
+        choice=$(ui_menu "Advanced Settings" \
+            "RYZENADJ_EXEC"     "$(get_key RYZENADJ_EXEC)" \
+            "RYZENADJ_DELAY"    "$(get_key RYZENADJ_DELAY)" \
+            "MONITOR_INTERVAL"  "$(get_key MONITOR_INTERVAL)" \
+            "STABLE_SAMPLE_COUNT" "$(get_key STABLE_SAMPLE_COUNT)" \
+            "DEVICE_PROFILE_FILE" "$(get_key DEVICE_PROFILE_FILE)" \
+            "GAME_PROFILE_FILE"   "$(get_key GAME_PROFILE_FILE)" \
+            "back"              "Return to main menu") || break
+
+        case "$choice" in
+            back|"") break ;;
+            RYZENADJ_EXEC|DEVICE_PROFILE_FILE|GAME_PROFILE_FILE)
+                local new
+                new=$(ui_input "$choice" "$(get_key "$choice")") || continue
+                [ -n "$new" ] && set_key "$choice" "$new" ;;
+            RYZENADJ_DELAY|MONITOR_INTERVAL|STABLE_SAMPLE_COUNT)
+                edit_tdp "$choice" "$choice" 0 3600 ;;
+        esac
+    done
+}
+
+# --- Main menu ---
+configui() {
+    while true; do
+        local choice locked
+        if profile_active; then
+            locked="[LOCKED - profile active]"
+        else
+            locked=""
+        fi
+
+        choice=$(ui_menu "AutoTDP Configuration" \
+            "min_tdp"      "MIN_TDP       = $(get_key MIN_TDP) $locked" \
+            "default_tdp"  "DEFAULT_TDP   = $(get_key DEFAULT_TDP) $locked" \
+            "max_cpu_tdp"  "MAX_CPU_TDP   = $(get_key MAX_CPU_TDP) $locked" \
+            "step_tdp"     "STEP_TDP      = $(get_key STEP_TDP) $locked" \
+            "battery_tdp"  "BATTERY_MAX_TDP = $(get_key BATTERY_MAX_TDP) $locked" \
+            "device_prof"  "DEVICE_PROFILE  = $(get_key DEVICE_PROFILE)" \
+            "perf_mode"    "PERFORMANCE_MODE = $(get_key PERFORMANCE_MODE)" \
+            "advanced"     "Advanced settings (danger)" \
+            "quit"         "Exit") || break
+
+        # Guard: block edits to profile-managed keys
+        case "$choice" in
+            min_tdp|default_tdp|max_cpu_tdp|step_tdp|battery_tdp)
+                if profile_active; then
+                    ui_msg "Locked" \
+                        "This value is managed by DEVICE_PROFILE ($(get_key DEVICE_PROFILE)).\n\nThe daemon overwrites manual changes while a profile is active.\n\nTo edit manually, set DEVICE_PROFILE to OFF first."
+                    continue
+                fi
+                ;;
+        esac
+
+        case "$choice" in
+            min_tdp)     edit_tdp MIN_TDP       "Minimum TDP (mW)"       1000  50000 ;;
+            default_tdp) edit_tdp DEFAULT_TDP   "Default TDP (mW)"       1000  50000 ;;
+            max_cpu_tdp) edit_tdp MAX_CPU_TDP   "Max CPU TDP (mW)"       1000 100000 ;;
+            step_tdp)    edit_tdp STEP_TDP      "TDP Step (mW)"           100  10000 ;;
+            battery_tdp) edit_tdp BATTERY_MAX_TDP "Battery Max TDP (mW)"  1000 100000 ;;
+            device_prof) edit_device_profile ;;
+            perf_mode)   edit_perf_mode ;;
+            advanced)    advanced_settings ;;
+            quit|"") break ;;
+        esac
+    done
+    clear
+}
+
 create_default_config() {
     run_privileged tee "$CONFIG_FILE" > /dev/null <<EOF
 MIN_TDP=$MIN_TDP
@@ -1414,6 +1744,52 @@ EOF
 # Main script
 
 parse_arguments "$@"
+
+if (( TEST_MODE == 1 )); then
+    # Sandbox: everything lives in ./testenv next to the script
+    CONFIG_DIR="$SCRIPT_DIR/testenv"
+    CONFIG_FILE="$CONFIG_DIR/AutoTDP.config"
+    LOG_DIR="$CONFIG_DIR/logs"
+    LOG_FILE="$LOG_DIR/test_$(date +'%Y-%m-%d_%H-%M-%S').log"
+    KNOWN_DEVICES_FILE="$SCRIPT_DIR/known_devices.json"
+    GAME_PROFILES_FILE="$SCRIPT_DIR/game_profiles.json"
+    mkdir -p "$CONFIG_DIR" "$LOG_DIR"
+
+    # No privilege escalation in test mode
+    run_privileged() { "$@"; }
+
+    # The UI only actually needs jq (device profile listing)
+    if ! command -v jq > /dev/null 2>&1; then
+        echo "Test mode requires jq (for the device profile browser)"
+        exit 1
+    fi
+
+    # Seed a config to edit if there isn't one yet
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        echo "Creating test config at $CONFIG_FILE"
+        create_default_config
+    fi
+
+    # Load it exactly like the real path does
+    source "$CONFIG_FILE"
+
+    : "${MIN_TDP:=5000}"
+    : "${DEFAULT_TDP:=10000}"
+    : "${MAX_CPU_TDP:=18000}"
+    : "${STEP_TDP:=1000}"
+    : "${RYZENADJ_EXEC:=ryzenadj}"
+    : "${RYZENADJ_DELAY:=4}"
+    : "${MONITOR_INTERVAL:=5}"
+    : "${STABLE_SAMPLE_COUNT:=2}"
+    : "${BATTERY_MAX_TDP:=$MAX_CPU_TDP}"
+    : "${DEVICE_PROFILE:=generic}"
+    : "${DEVICE_PROFILE_FILE:=$KNOWN_DEVICES_FILE}"
+    : "${PERFORMANCE_MODE:=balanced}"
+    : "${GAME_PROFILE_FILE:=$GAME_PROFILES_FILE}"
+
+    configui
+    exit 0
+fi
 
 if [[ $ACTION == "help" ]]; then
     print_usage
@@ -1459,7 +1835,7 @@ source "$CONFIG_FILE"
 : "${MONITOR_INTERVAL:=5}"
 : "${STABLE_SAMPLE_COUNT:=2}"
 : "${BATTERY_MAX_TDP:=$MAX_CPU_TDP}"
-: "${DEVICE_PROFILE:=generic}"
+: "${DEVICE_PROFILE-=generic}" #only set if UNSET. do not set if "empty"
 : "${DEVICE_PROFILE_FILE:=$KNOWN_DEVICES_FILE}"
 : "${PERFORMANCE_MODE:=balanced}"
 : "${GAME_PROFILE_FILE:=$GAME_PROFILES_FILE}"
@@ -1564,6 +1940,12 @@ if [[ $ACTION == "update" ]]; then
     SKIP_CLEANUP=1
     perform_self_update
     exit $?
+fi
+
+if [[ $ACTION == "configui" ]]; then
+    SKIP_CLEANUP=1
+    configui
+    exit 0
 fi
 
 # Start monitoring and adjusting TDP
