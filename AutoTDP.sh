@@ -414,7 +414,8 @@ set_mcu_powersave() {
     local path
     for path in "${MCU_POWERSAVE_PATHS[@]}"; do
         if [[ -w "$path" ]]; then
-            if printf '1' > "$path" 2>/dev/null; then
+            #itd be 1, but it looks like it's breaking SMU control on awake
+            if printf '0' > "$path" 2>/dev/null; then
                 log "MCU powersave enabled via $path"
                 return 0
             fi
