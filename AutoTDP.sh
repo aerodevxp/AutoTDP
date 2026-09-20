@@ -1312,10 +1312,7 @@ monitor_and_adjust() {
             set_platform_profile "$target_tdp"
             current_tdp=$target_tdp
             last_adjustment=$EPOCHSECONDS
-            if (( loading_boost )); then
-                log "TDP: $((old_tdp / 1000))W → $((target_tdp / 1000))W via ${TDP_LOG} (load ${load}%, smooth ${smooth_load}% [LOADING])"
-            else
-                log "TDP: $((old_tdp / 1000))W → $((target_tdp / 1000))W via ${TDP_LOG} (load ${load}%, smooth ${smooth_load}%)"
+            log "TDP: $((old_tdp / 1000))W → $((target_tdp / 1000))W via ${TDP_LOG} (load ${load}%, smooth ${smooth_load}%)"
             fi
         fi
     done
