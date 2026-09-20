@@ -1270,7 +1270,7 @@ monitor_and_adjust() {
             sleep 0.5
             get_max_cpu_usage "$prev_snapshot"
             prev_snapshot=$CUR_SNAPSHOT
-            sig=$(( (CUR_TOP4 + CUR_PEAK) / 2 ))
+            sig=$(( (CUR_TOP4 * 3 + CUR_PEAK) / 4 ))
             sig_samples+=( "$sig" )
             (( sig > max_sig )) && max_sig=$sig
             get_max_gpu_usage
