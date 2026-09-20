@@ -67,6 +67,11 @@ ACTIVE_MONITOR_INTERVAL=$MONITOR_INTERVAL
 ACTIVE_STABLE_SAMPLE_COUNT=$STABLE_SAMPLE_COUNT
 ACTIVE_THRESHOLD_OFFSET=0
 
+CUR_TOP4=0
+CUR_PEAK=0
+CUR_BREADTH=0
+CUR_SNAPSHOT=""
+
 SERVICE_FILE="/etc/systemd/system/autotdp.service"
 SCRIPT_DEST="/usr/local/bin/autotdp.sh"
 UPDATE_URL="https://raw.githubusercontent.com/aerodevxp/AutoTDP/refs/heads/main/AutoTDP.sh"
@@ -1192,6 +1197,8 @@ monitor_and_adjust() {
     local base_target target_tdp diff
     local -a sig_samples=()
     local -a gpu_samples=()
+
+
 
     get_max_cpu_usage ""
     prev_snapshot=$CUR_SNAPSHOT
