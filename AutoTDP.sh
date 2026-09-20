@@ -432,13 +432,13 @@ read_core_snapshot() {
 
 # Computes the busiest single core's busy percentage against the previous snapshot.
 get_max_cpu_usage() {
-    local previous=$1
-    local current
-    local top4=0 peak=0 breadth=0
+    local previous=$1 current
+    local peak=0 t1=0 t2=0 t3=0 t4=0 breadth=0
     local i n td id busy pct
-    local -a pts cts pcts
+    local -a pts cts
 
-    current=$(read_core_snapshot)
+    read_core_snapshot
+    current=$SNAPSHOT
 
     read -r -a pts <<< "$previous"
     read -r -a cts <<< "$current"
@@ -449,23 +449,24 @@ get_max_cpu_usage() {
         for ((i=0; i<n; i++)); do
             td=$(( ${cts[i*2]} - ${pts[i*2]} ))
             id=$(( ${cts[i*2+1]} - ${pts[i*2+1]} ))
-            if (( td <= 0 )); then
-                continue
-            fi
+            (( td <= 0 )) && continue
             busy=$((td - id))
             (( busy < 0 )) && busy=0
             pct=$(( busy * 100 / td ))
-            pcts+=("$pct")
             (( pct > peak )) && peak=$pct
             (( pct >= 40 )) && breadth=$((breadth + 1))
+            if (( pct >= t1 )); then t4=$t3; t3=$t2; t2=$t1; t1=$pct
+            elif (( pct >= t2 )); then t4=$t3; t3=$t2; t2=$pct
+            elif (( pct >= t3 )); then t4=$t3; t3=$pct
+            elif (( pct >= t4 )); then t4=$pct
+            fi
         done
-
-        if (( ${#pcts[@]} > 0 )); then
-            top4=$(printf '%s\n' "${pcts[@]}" | sort -rn | head -4 | awk '{s+=$1} END {printf "%d", s / NR}')
-        fi
     fi
 
-    echo "$top4 $breadth $peak $current"
+    CUR_TOP4=$(( (t1 + t2 + t3 + t4) / 4 ))
+    CUR_PEAK=$peak
+    CUR_BREADTH=$breadth
+    CUR_SNAPSHOT=$current
 }
 
 
@@ -1270,7 +1271,23 @@ monitor_and_adjust() {
             sleep 0.5
             get_max_cpu_usage "$prev_snapshot"
             prev_snapshot=$CUR_SNAPSHOT
-            sig=$(( (CUR_TOP4 * 3 + CUR_PEAK) / 4 ))
+
+            # Dynamic weighting: multicore workloads care about top4,
+            # single-thread workloads care about peak (for boost ceiling)
+            local peak_w top4_w
+            if (( CUR_BREADTH >= 4 )); then
+                # Heavy multicore (emulation): top4 is 80% of signal
+                top4_w=4; peak_w=1
+            elif (( CUR_BREADTH >= 2 )); then
+                # Moderate multicore: 60/40 split
+                top4_w=3; peak_w=2
+            else
+                # Single core dominant: peak is 60% — but it's likely already
+                # at boost ceiling, so this just keeps us from under-responding
+                top4_w=2; peak_w=3
+            fi
+            sig=$(( (CUR_TOP4 * top4_w + CUR_PEAK * peak_w) / (top4_w + peak_w) ))
+            
             sig_samples+=( "$sig" )
             (( sig > max_sig )) && max_sig=$sig
             get_max_gpu_usage
