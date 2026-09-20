@@ -409,14 +409,14 @@ set_platform_profile() {
     fi
 }
 
-# DISABLE MCU powersave for stability
+# Enable MCU powersave for suspend power savings
 set_mcu_powersave() {
     local path
     for path in "${MCU_POWERSAVE_PATHS[@]}"; do
         if [[ -w "$path" ]]; then
             #itd be 1, but it looks like it's breaking SMU control on awake
             if printf '0' > "$path" 2>/dev/null; then
-                log "MCU powersave dsiabled via $path"
+                log "MCU powersave enabled via $path"
                 return 0
             fi
         fi
@@ -424,6 +424,49 @@ set_mcu_powersave() {
     # Not an error if path doesn't exist — non-ASUS devices won't have it
 }
 
+# Reads per-core cumulative CPU times as a single snapshot string
+read_core_snapshot() {
+    awk '/^cpu[0-9]+/ {printf "%s %s ", $2+$3+$4+$5+$6+$7+$8+$9, $5} END {print ""}' /proc/stat
+}
+
+
+# Computes the busiest single core's busy percentage against the previous snapshot.
+get_max_cpu_usage() {
+    local previous=$1
+    local current
+    local top4=0 peak=0 breadth=0
+    local i n td id busy pct
+    local -a pts cts pcts
+
+    current=$(read_core_snapshot)
+
+    read -r -a pts <<< "$previous"
+    read -r -a cts <<< "$current"
+
+    n=$(( ${#cts[@]} / 2 ))
+
+    if (( ${#pts[@]} == ${#cts[@]} && n > 0 )); then
+        for ((i=0; i<n; i++)); do
+            td=$(( ${cts[i*2]} - ${pts[i*2]} ))
+            id=$(( ${cts[i*2+1]} - ${pts[i*2+1]} ))
+            if (( td <= 0 )); then
+                continue
+            fi
+            busy=$((td - id))
+            (( busy < 0 )) && busy=0
+            pct=$(( busy * 100 / td ))
+            pcts+=("$pct")
+            (( pct > peak )) && peak=$pct
+            (( pct >= 40 )) && breadth=$((breadth + 1))
+        done
+
+        if (( ${#pcts[@]} > 0 )); then
+            top4=$(printf '%s\n' "${pcts[@]}" | sort -rn | head -4 | awk '{s+=$1} END {printf "%d", s / NR}')
+        fi
+    fi
+
+    echo "$top4 $breadth $peak $current"
+}
 
 
 # Trimmed mean of args (drops high and low); sets TM_RESULT. No forks.
@@ -449,7 +492,7 @@ read_core_snapshot() {
         case "$line" in
             cpu[0-9]*)
                 set -- $line
-                SNAPSHOT+="$(( $2+$3+$4+$5+$6+$7+$8+$9 )) $(( $5 )) "
+                SNAPSHOT+="$(( $2+$3+$4+$5+$6+$7+$8+$9 )) $(( $5+$6 )) "
                 ;;
         esac
     done < /proc/stat
@@ -457,7 +500,7 @@ read_core_snapshot() {
 
 get_max_cpu_usage() {
     local previous=$1 current
-    local peak=0 t1=0 t2=0 t3=0 t4=0 breadth=0
+    local peak=0 t1=0 t2=0 t3=0 t4=0
     local i n td id busy pct
     local -a pts cts
 
@@ -478,7 +521,6 @@ get_max_cpu_usage() {
             (( busy < 0 )) && busy=0
             pct=$(( busy * 100 / td ))
             (( pct > peak )) && peak=$pct
-            (( pct >= 15 )) && breadth=$((breadth + 1))
             if (( pct >= t1 )); then t4=$t3; t3=$t2; t2=$t1; t1=$pct
             elif (( pct >= t2 )); then t4=$t3; t3=$t2; t2=$pct
             elif (( pct >= t3 )); then t4=$t3; t3=$pct
@@ -489,7 +531,6 @@ get_max_cpu_usage() {
 
     CUR_TOP4=$(( (t1 + t2 + t3 + t4) / 4 ))
     CUR_PEAK=$peak
-    CUR_BREADTH=$breadth
     CUR_SNAPSHOT=$current
 }
 
@@ -1147,8 +1188,7 @@ monitor_and_adjust() {
     local last_spike=0
 
     local cpu_signal=0 gpu_usage=0 load=0 smooth_load=-1 sig=0 max_sig=0
-    local max_breadth=0
-    local base_target target_tdp diff loading_boost
+    local base_target target_tdp diff
     local -a sig_samples=()
     local -a gpu_samples=()
 
@@ -1226,7 +1266,6 @@ monitor_and_adjust() {
         sig_samples=()
         gpu_samples=()
         max_sig=0
-        max_breadth=0
         for (( sub=0; sub < ACTIVE_MONITOR_INTERVAL * 2; sub++ )); do
             sleep 0.5
             get_max_cpu_usage "$prev_snapshot"
@@ -1234,7 +1273,6 @@ monitor_and_adjust() {
             sig=$(( (CUR_TOP4 + CUR_PEAK) / 2 ))
             sig_samples+=( "$sig" )
             (( sig > max_sig )) && max_sig=$sig
-            (( CUR_BREADTH > max_breadth )) && max_breadth=$CUR_BREADTH
             get_max_gpu_usage
             gpu_samples+=( "$MAX_GPU" )
         done
@@ -1261,7 +1299,7 @@ monitor_and_adjust() {
             last_spike=$EPOCHSECONDS
         fi
 
-        log "CPU: ${cpu_signal}% (spike ${max_sig}% breadth ${max_breadth}) | GPU: ${gpu_usage}% | load: ${load}% (fulltdp@${eff_full}%) | TDP: $((current_tdp / 1000))W"
+        log "CPU: ${cpu_signal}% (spike ${max_sig}%) | GPU: ${gpu_usage}% | load: ${load}% (fulltdp@${eff_full}%) | TDP: $((current_tdp / 1000))W"
 
         # Re-assert limits occasionally in case the EC resets them
         if (( EPOCHSECONDS - last_adjustment > 300 )); then
@@ -1271,7 +1309,8 @@ monitor_and_adjust() {
 
         # 90% load = ceiling, 45% = halfway, linear
         # --- Proportional target ---
-        if (( smooth_load < 20 )); then
+        # Below 15% load (and GPU idle): the minimum exists precisely for this.
+        if (( smooth_load < 15 )); then
             base_target=$MIN_TDP
         elif (( smooth_load >= eff_full )); then
             base_target=$ceiling
@@ -1290,7 +1329,6 @@ monitor_and_adjust() {
             target_tdp=$base_target
         fi
 
-        # Cap target at real ceiling (don't let spikes exceed hardware limits)
         (( target_tdp > ceiling )) && target_tdp=$ceiling
         (( target_tdp < MIN_TDP )) && target_tdp=$MIN_TDP
 
@@ -1313,7 +1351,6 @@ monitor_and_adjust() {
             current_tdp=$target_tdp
             last_adjustment=$EPOCHSECONDS
             log "TDP: $((old_tdp / 1000))W → $((target_tdp / 1000))W via ${TDP_LOG} (load ${load}%, smooth ${smooth_load}%)"
-            fi
         fi
     done
 }
