@@ -1271,22 +1271,12 @@ monitor_and_adjust() {
 
         # 90% load = ceiling, 45% = halfway, linear
         # --- Proportional target ---
-        # Below 25% load (and GPU idle): the minimum exists precisely for this.
-        if (( smooth_load < 25 )); then
+        if (( smooth_load < 20 )); then
             base_target=$MIN_TDP
         elif (( smooth_load >= eff_full )); then
             base_target=$ceiling
         else
             base_target=$(( MIN_TDP + (ceiling - MIN_TDP) * smooth_load / eff_full ))
-        fi
-
-        # Loading detection: cores active but GPU idle = I/O-bound loading
-        # (decompression, shader compilation, texture streaming).
-        # Don't starve these workloads — they need CPU power, not GPU.
-        loading_boost=0
-        if (( max_breadth > 0 && gpu_usage < 25 )); then
-            base_target=$ACTIVE_DEFAULT_TDP
-            loading_boost=1
         fi
 
         # --- Spike bonuses ---
