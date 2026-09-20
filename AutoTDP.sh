@@ -409,14 +409,14 @@ set_platform_profile() {
     fi
 }
 
-# Enable MCU powersave for suspend power savings
+# DISABLE MCU powersave for stability
 set_mcu_powersave() {
     local path
     for path in "${MCU_POWERSAVE_PATHS[@]}"; do
         if [[ -w "$path" ]]; then
             #itd be 1, but it looks like it's breaking SMU control on awake
             if printf '0' > "$path" 2>/dev/null; then
-                log "MCU powersave enabled via $path"
+                log "MCU powersave dsiabled via $path"
                 return 0
             fi
         fi
