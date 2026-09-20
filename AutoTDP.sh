@@ -1284,7 +1284,7 @@ monitor_and_adjust() {
         # (decompression, shader compilation, texture streaming).
         # Don't starve these workloads — they need CPU power, not GPU.
         loading_boost=0
-        if (( max_breadth > 0 && gpu_usage < 25 && base_target < ACTIVE_DEFAULT_TDP )); then
+        if (( max_breadth > 0 && gpu_usage < 25 )); then
             base_target=$ACTIVE_DEFAULT_TDP
             loading_boost=1
         fi
@@ -1300,6 +1300,7 @@ monitor_and_adjust() {
             target_tdp=$base_target
         fi
 
+        # Cap target at real ceiling (don't let spikes exceed hardware limits)
         (( target_tdp > ceiling )) && target_tdp=$ceiling
         (( target_tdp < MIN_TDP )) && target_tdp=$MIN_TDP
 
