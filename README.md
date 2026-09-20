@@ -6,8 +6,6 @@ For Ally/ASUS devices, it uses WMI Platform Profiles for fans.
 
 **See releases page for installation instructions!**
 
-To change settings, launch the config UI, available on the desktop or with `/usr/local/bin/autotdp.sh --configui`.
-
 In some rare cases after long sleep/suspend periods. the SMU of your APU might be bugged, forcing the TDP to be low. This is not something I can't fix nor change, as it's a firmware bug. You will have to reboot if that happens for the SMU firmware to reset. The blame is not on this script.
 
 ## Showcase
