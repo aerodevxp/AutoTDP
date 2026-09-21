@@ -1214,6 +1214,10 @@ monitor_and_adjust() {
     local prev_usage=0
     local fps_settled=0
     local was_decreasing=0
+    local fps_active=0          # Sticky flag: once active, stay active
+    local fps_fail_count=0      # Track consecutive read failures
+    local -a fps_history=()     # Buffer for averaging
+    local FPS_AVG_SIZE=4        # Average over ~4 cycles (12-16 seconds)
 
     # Proportional mapping: load% maps linearly onto MIN..ceiling.
     # 90% load = full ceiling, 45% = halfway, below scales toward MIN.
@@ -1304,15 +1308,42 @@ monitor_and_adjust() {
         # Get current FPS if we have a target
         if [[ -n "$target_fps" && "$target_fps" -gt 0 ]]; then
             current_fps=$(get_gamescope_fps || true)
+            
             if [[ -n "$current_fps" && "$current_fps" -gt 0 ]]; then
-                # Normalize FPS (handle doubled/tripled values on high refresh displays)
+                # Normalize FPS (handle doubled/tripled values)
                 current_fps=$(normalize_fps "$current_fps" "$target_fps")
+                
+                # Add to history buffer
+                fps_history+=("$current_fps")
+                (( ${#fps_history[@]} > FPS_AVG_SIZE )) && fps_history=("${fps_history[@]:1}")
+                
+                # Calculate average FPS from buffer
+                local fps_sum=0
+                for f in "${fps_history[@]}"; do
+                    (( fps_sum += f ))
+                done
+                current_fps=$(( fps_sum / ${#fps_history[@]} ))
+                
+                # Activate sticky controller
+                fps_active=1
+                fps_fail_count=0
                 use_fps_controller=1
             else
-                use_fps_controller=0
+                # Read failed — use sticky logic
+                (( fps_fail_count++ ))
+                
+                if (( fps_active == 1 && fps_fail_count < 5 )); then
+                    # Keep using last known FPS, don't fall back to load logic
+                    use_fps_controller=1
+                else
+                    # Too many failures, deactivate
+                    fps_active=0
+                    use_fps_controller=0
+                fi
             fi
         else
             use_fps_controller=0
+            fps_active=0
         fi
 
         # Periodic update check
@@ -1417,13 +1448,19 @@ monitor_and_adjust() {
 
         # --- FPS Controller Override ---
         if (( use_fps_controller == 1 )); then
-            if (( current_tdp >= ceiling && current_fps < target_fps )); then
-                target_tdp=$ceiling
-                fps_settled=1
-            elif (( was_decreasing == 1 )); then
+            # Use averaged FPS for decisions
+            local avg_fps=$current_fps
+            
+            # Target is okay if within 2 FPS of target (avoids false alarms)
+            local fps_ok=0
+            if (( avg_fps >= target_fps - 2 )); then
+                fps_ok=1
+            fi
+            
+            if (( was_decreasing == 1 )); then
                 # We just decreased TDP last cycle, check if FPS held
-                if (( current_fps < target_fps )); then
-                    # FPS dropped: go back up 1W and settle
+                if (( avg_fps < target_fps - 2 )); then
+                    # FPS dropped below threshold: go back up 1W and settle
                     target_tdp=$(( current_tdp + STEP_TDP ))
                     fps_settled=1
                 else
@@ -1432,12 +1469,12 @@ monitor_and_adjust() {
                     fps_settled=1
                 fi
                 was_decreasing=0
-            elif (( current_fps < target_fps )); then
+            elif (( avg_fps < target_fps - 2 )); then
                 # Below target: ramp up
                 if (( fps_settled == 1 )); then
                     # Was settled, go up 1W
                     target_tdp=$(( current_tdp + STEP_TDP ))
-                elif (( current_fps < target_fps - 5 )); then
+                elif (( avg_fps < target_fps - 8 )); then
                     # Far below: ramp up 2W
                     target_tdp=$(( current_tdp + 2 * STEP_TDP ))
                 else
@@ -1445,12 +1482,12 @@ monitor_and_adjust() {
                     target_tdp=$(( current_tdp + STEP_TDP ))
                 fi
                 fps_settled=0
-            elif (( current_fps <= target_fps + 5 )); then
-                # At target: hold
+            elif (( fps_ok == 1 )); then
+                # At target (within 2): hold steady, don't go higher
                 target_tdp=$current_tdp
                 fps_settled=1
             else
-                # Above target: only go down if usage dropped 10%+
+                # Above target by more than 2: only go down if usage dropped 10%+
                 if (( prev_usage > 0 && load <= prev_usage * 9 / 10 )); then
                     target_tdp=$(( current_tdp - STEP_TDP ))
                     was_decreasing=1
