@@ -1336,11 +1336,11 @@ monitor_and_adjust() {
         trimmed_mean "${sig_samples[@]}"; cpu_signal=$TM_RESULT
         trimmed_mean "${gpu_samples[@]}"; gpu_usage=$TM_RESULT
 
-        # The bottleneck sets the load: GPU, but only if CPU isn't being used by 50% more
+        # The bottleneck sets the load: GPU main, but only if CPU isn't being used by 50% more (average in that case)
         if (( 3 * gpu_usage > 2 * cpu_signal )); then
             load=$gpu_usage
         else
-            load=$cpu_signal
+            load=$(( (cpu_signal + gpu_usage) / 2 ))
         fi
 
         # Smooth between cycles so single-cycle dips don't jerk the target
