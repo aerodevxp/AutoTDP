@@ -1227,6 +1227,8 @@ monitor_and_adjust() {
     local fps_fail_count=0      # Track consecutive read failures
     local -a fps_history=()     # Buffer for averaging
     local FPS_AVG_SIZE=4        # Average over ~4 cycles (12-16 seconds)
+    local probe_down_counter=0
+    local PROBE_DOWN_INTERVAL=10  # ~30-40 seconds (10 cycles)
 
     # Proportional mapping: load% maps linearly onto MIN..ceiling.
     # 90% load = full ceiling, 45% = halfway, below scales toward MIN.
@@ -1460,54 +1462,36 @@ monitor_and_adjust() {
 
         # --- FPS Controller Override ---
         if (( use_fps_controller == 1 )); then
-            # Use averaged FPS for decisions
             local avg_fps=$current_fps
             
-            # Target is okay if within 2 FPS of target (avoids false alarms)
+            # Target is okay if within 1 FPS of target
             local fps_ok=0
-            if (( avg_fps >= target_fps - 2 )); then
+            if (( avg_fps >= target_fps - 1 )); then
                 fps_ok=1
             fi
             
-            if (( was_decreasing == 1 )); then
-                # We just decreased TDP last cycle, check if FPS held
-                if (( avg_fps < target_fps - 2 )); then
-                    # FPS dropped below threshold: go back up 1W and settle
-                    target_tdp=$(( current_tdp + STEP_TDP ))
-                    fps_settled=1
-                else
-                    # FPS held: settle at new lower TDP
-                    target_tdp=$current_tdp
-                    fps_settled=1
-                fi
+            if (( avg_fps < target_fps - 1 )); then
+                # FPS is too low: go up 1W immediately
+                target_tdp=$(( current_tdp + STEP_TDP ))
                 was_decreasing=0
-            elif (( avg_fps < target_fps - 2 )); then
-                # Below target: ramp up
-                if (( fps_settled == 1 )); then
-                    # Was settled, go up 1W
-                    target_tdp=$(( current_tdp + STEP_TDP ))
-                elif (( avg_fps < target_fps - 8 )); then
-                    # Far below: ramp up 2W
-                    target_tdp=$(( current_tdp + 2 * STEP_TDP ))
-                else
-                    # Close: ramp up 1W
-                    target_tdp=$(( current_tdp + STEP_TDP ))
-                fi
-                fps_settled=0
             elif (( fps_ok == 1 )); then
-                # At target (within 2): hold steady, don't go higher
-                target_tdp=$current_tdp
-                fps_settled=1
-            else
-                # Above target by more than 2: only go down if usage dropped 10%+
-                if (( prev_usage > 0 && load <= prev_usage * 9 / 10 )); then
+                if (( was_decreasing == 1 )); then
+                    # We just decreased TDP last cycle.
+                    # Since FPS is still okay, we successfully found a lower state!
+                    target_tdp=$current_tdp
+                    was_decreasing=0
+                elif (( prev_usage > 0 && load <= prev_usage * 9 / 10 )); then
+                    # Hardware load dropped by 10%+: safely go down 1W
                     target_tdp=$(( current_tdp - STEP_TDP ))
                     was_decreasing=1
-                    fps_settled=0
                 else
+                    # Load is steady, hold TDP to protect physics-based games
                     target_tdp=$current_tdp
-                    fps_settled=1
                 fi
+            else
+                # FPS is above target (e.g., 65/60). Hold steady.
+                target_tdp=$current_tdp
+                was_decreasing=0
             fi
         fi
         # ------------------------------
