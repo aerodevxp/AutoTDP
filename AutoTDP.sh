@@ -1516,6 +1516,9 @@ monitor_and_adjust() {
             last_adjustment=$EPOCHSECONDS
             log "TDP: $((old_tdp / 1000))W → $((target_tdp / 1000))W via ${TDP_LOG} (load ${load}%, smooth ${smooth_load}%)"
         fi
+
+        # Track previous usage for FPS controller load-drop detection
+        prev_usage=$load
     done
 }
 
