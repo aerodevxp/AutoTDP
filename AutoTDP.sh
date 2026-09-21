@@ -818,51 +818,64 @@ get_steam_user_id() {
 get_steam_fps_limit() {
     local appid=$1
     local config_file user_id disabled limit
-
     user_id=$(get_steam_user_id) || return 1
     config_file=$(ls /home/*/.local/share/Steam/userdata/$user_id/config/localconfig.vdf 2>/dev/null | head -1)
     [[ -z "$config_file" ]] && return 1
-
-    # Check if frame limit is disabled for this app
     disabled=$(sed -n '/"DisableFrameLimit"/,/}/p' "$config_file" | grep "\"$appid\"" | awk '{print $2}' | tr -d '"')
-    if [[ "$disabled" == "1" ]]; then
-        return 1 # No limit
-    fi
-
-    # Get the limit for this app
+    if [[ "$disabled" == "1" ]]; then return 1; fi
     limit=$(sed -n '/"AppTargetFrameRate"/,/}/p' "$config_file" | grep "\"$appid\"" | awk '{print $2}' | tr -d '"')
-    
-    # If no per-game limit, fall back to the global default (AppID 3582452512)
     if [[ -z "$limit" ]]; then
-        # Check if global default has frame limit disabled
         disabled=$(sed -n '/"DisableFrameLimit"/,/}/p' "$config_file" | grep "\"3582452512\"" | awk '{print $2}' | tr -d '"')
-        if [[ "$disabled" == "1" ]]; then
-            return 1
-        fi
+        if [[ "$disabled" == "1" ]]; then return 1; fi
         limit=$(sed -n '/"AppTargetFrameRate"/,/}/p' "$config_file" | grep "\"3582452512\"" | awk '{print $2}' | tr -d '"')
     fi
-
-    if [[ -n "$limit" ]]; then
-        echo "$limit"
-        return 0
-    fi
-
+    if [[ -n "$limit" ]]; then echo "$limit"; return 0; fi
     return 1
 }
+
 get_gamescope_fps() {
-    local pipe fps_data fps
+    local pipe fps
     for pipe in /run/user/*/gamescope.*/stats.pipe; do
         [[ -p "$pipe" ]] || continue
-        # Read for 0.5s, extract max fps (which is usually the cap if hit)
-        fps_data=$(timeout 0.5 cat "$pipe" 2>/dev/null)
-        [[ -z "$fps_data" ]] && continue
-        fps=$(echo "$fps_data" | awk -F= '/^fps=/ {if ($2 > max) max=$2} END {if (max != "") printf "%d", max + 0.5}')
-        [[ -z "$fps" ]] && continue
-        echo "$fps"
-        return 0
+        
+        fps=$(
+            exec 3< "$pipe"
+            last_fps=""
+            while read -t 2 -r line <&3; do
+                if [[ "$line" =~ ^fps= ]]; then
+                    last_fps="${line#fps=}"
+                fi
+            done
+            exec 3<&-
+            if [[ -n "$last_fps" ]]; then
+                printf "%d" "${last_fps%.*}"
+            fi
+        )
+        
+        if [[ -n "$fps" && "$fps" -gt 0 ]]; then
+            echo "$fps"
+            return 0
+        fi
     done
     return 1
 }
+normalize_fps() {
+    local raw_fps=$1
+    local target_fps=$2
+    local factor
+    
+    # If raw FPS is more than 10 over target, it might be multiplied by display refresh
+    if (( raw_fps > target_fps + 10 )); then
+        # Calculate factor: how many times target fits into raw (rounded)
+        factor=$(( (raw_fps + target_fps / 2) / target_fps ))
+        (( factor < 1 )) && factor=1
+        echo $(( raw_fps / factor ))
+        return 0
+    fi
+    
+    echo "$raw_fps"
+}
+
 
 normalize_executable_name() {
     local value=$1
@@ -1198,6 +1211,9 @@ monitor_and_adjust() {
     local current_fps=0
     local fps_appid=""
     local use_fps_controller=0
+    local prev_usage=0
+    local fps_settled=0
+    local was_decreasing=0
 
     # Proportional mapping: load% maps linearly onto MIN..ceiling.
     # 90% load = full ceiling, 45% = halfway, below scales toward MIN.
@@ -1289,6 +1305,8 @@ monitor_and_adjust() {
         if [[ -n "$target_fps" && "$target_fps" -gt 0 ]]; then
             current_fps=$(get_gamescope_fps || true)
             if [[ -n "$current_fps" && "$current_fps" -gt 0 ]]; then
+                # Normalize FPS (handle doubled/tripled values on high refresh displays)
+                current_fps=$(normalize_fps "$current_fps" "$target_fps")
                 use_fps_controller=1
             else
                 use_fps_controller=0
@@ -1399,16 +1417,48 @@ monitor_and_adjust() {
 
         # --- FPS Controller Override ---
         if (( use_fps_controller == 1 )); then
-            
-            if (( current_fps < target_fps - 5 )); then
-                # Struggling: ramp up aggressively
-                target_tdp=$(( current_tdp + 2 * STEP_TDP ))
-            elif (( current_fps >= target_fps - 2 )); then
-                # Hitting cap: try to save power by dropping 1W
-                target_tdp=$(( current_tdp - STEP_TDP ))
-            else
-                # Close to target: hold steady
+            if (( current_tdp >= ceiling && current_fps < target_fps )); then
+                target_tdp=$ceiling
+                fps_settled=1
+            elif (( was_decreasing == 1 )); then
+                # We just decreased TDP last cycle, check if FPS held
+                if (( current_fps < target_fps )); then
+                    # FPS dropped: go back up 1W and settle
+                    target_tdp=$(( current_tdp + STEP_TDP ))
+                    fps_settled=1
+                else
+                    # FPS held: settle at new lower TDP
+                    target_tdp=$current_tdp
+                    fps_settled=1
+                fi
+                was_decreasing=0
+            elif (( current_fps < target_fps )); then
+                # Below target: ramp up
+                if (( fps_settled == 1 )); then
+                    # Was settled, go up 1W
+                    target_tdp=$(( current_tdp + STEP_TDP ))
+                elif (( current_fps < target_fps - 5 )); then
+                    # Far below: ramp up 2W
+                    target_tdp=$(( current_tdp + 2 * STEP_TDP ))
+                else
+                    # Close: ramp up 1W
+                    target_tdp=$(( current_tdp + STEP_TDP ))
+                fi
+                fps_settled=0
+            elif (( current_fps <= target_fps + 5 )); then
+                # At target: hold
                 target_tdp=$current_tdp
+                fps_settled=1
+            else
+                # Above target: only go down if usage dropped 10%+
+                if (( prev_usage > 0 && load <= prev_usage * 9 / 10 )); then
+                    target_tdp=$(( current_tdp - STEP_TDP ))
+                    was_decreasing=1
+                    fps_settled=0
+                else
+                    target_tdp=$current_tdp
+                    fps_settled=1
+                fi
             fi
         fi
         # ------------------------------
