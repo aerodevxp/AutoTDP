@@ -1141,30 +1141,47 @@ determine_tdp() {
 }
 
 watch_steamui() {
-    local HANG_THRESHOLD=95
+    local HANG_THRESHOLD=98
     local HANG_DURATION=10
 
     log "Steam UI watcher started"
+    
+    # Associative arrays to store CPU times per PID
+    declare -A cpu_start
+
     while true; do
-        # Sum the total CPU time (in seconds) of all steamwebhelper processes
-        local cpu1 cpu2
-        cpu1=$(ps -eo cputime,comm | awk '/steamwebhelper/ {print $1}' | awk -F: '{ if (NF==3) s+=$1*3600+$2*60+$3; else if (NF==2) s+=$1*60+$2; else s+=$1 } END {print s}')
+        cpu_start=()
         
+        # Snapshot 1: Get all steamwebhelper PIDs and their CPU time
+        while read -r pid cputime; do
+            [[ -z "$pid" ]] && continue
+            # Convert HH:MM:SS to seconds
+            local sec
+            sec=$(echo "$cputime" | awk -F: '{ if (NF==3) print $1*3600+$2*60+$3; else if (NF==2) print $1*60+$2; else print $1 }')
+            cpu_start[$pid]=$sec
+        done < <(ps -eo pid,cputime,comm | awk '/steamwebhelper/ {print $1, $2}')
+
         sleep "$HANG_DURATION"
-        
-        cpu2=$(ps -eo cputime,comm | awk '/steamwebhelper/ {print $1}' | awk -F: '{ if (NF==3) s+=$1*3600+$2*60+$3; else if (NF==2) s+=$1*60+$2; else s+=$1 } END {print s}')
 
-        [[ -z "$cpu2" || -z "$cpu1" ]] && continue
+        # Snapshot 2: Check each PID individually
+        for pid in "${!cpu_start[@]}"; do
+            # If process died during sleep, skip it
+            [[ -e /proc/$pid ]] || continue
 
-        local diff avg_cpu
-        diff=$((cpu2 - cpu1))
-        # Calculate average CPU % over the duration
-        avg_cpu=$(( (diff * 100) / HANG_DURATION ))
+            local cputime sec diff avg_cpu
+            cputime=$(ps -p "$pid" -o cputime= 2>/dev/null)
+            [[ -z "$cputime" ]] && continue
 
-        if (( avg_cpu >= HANG_THRESHOLD )); then
-            log "steamwebhelper hung at ${avg_cpu}% CPU for ${HANG_DURATION}s. Killing..."
-            pkill -9 -f "steamwebhelper"
-        fi
+            sec=$(echo "$cputime" | awk -F: '{ if (NF==3) print $1*3600+$2*60+$3; else if (NF==2) print $1*60+$2; else print $1 }')
+            
+            diff=$((sec - ${cpu_start[$pid]}))
+            avg_cpu=$(( (diff * 100) / HANG_DURATION ))
+
+            if (( avg_cpu >= HANG_THRESHOLD )); then
+                log "steamwebhelper ($pid) hung at ${avg_cpu}% CPU for ${HANG_DURATION}s. Killing..."
+                kill -9 "$pid"
+            fi
+        done
 
         sleep 5
     done
