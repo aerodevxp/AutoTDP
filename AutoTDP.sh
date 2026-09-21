@@ -1180,10 +1180,12 @@ watch_steamui() {
             if (( avg_cpu >= HANG_THRESHOLD )); then
                 log "steamwebhelper ($pid) hung at ${avg_cpu}% CPU for ${HANG_DURATION}s. Killing..."
                 kill -9 "$pid"
+
             fi
         done
 
         sleep 5
+        systemctl restart plugin_loader
     done
 }
 
