@@ -67,7 +67,7 @@ ACTIVE_MONITOR_INTERVAL=$MONITOR_INTERVAL
 ACTIVE_STABLE_SAMPLE_COUNT=$STABLE_SAMPLE_COUNT
 ACTIVE_THRESHOLD_OFFSET=0
 
-CUR_TOP4=0
+CUR_TOTAL=0
 CUR_PEAK=0
 CUR_BREADTH=0
 CUR_SNAPSHOT=""
@@ -437,12 +437,6 @@ set_mcu_powersave() {
     # Not an error if path doesn't exist — non-ASUS devices won't have it
 }
 
-# Reads per-core cumulative CPU times as a single snapshot string
-read_core_snapshot() {
-    awk '/^cpu[0-9]+/ {printf "%s %s ", $2+$3+$4+$5+$6+$7+$8+$9, $5} END {print ""}' /proc/stat
-}
-
-
 # Trimmed mean of args (drops high and low); sets TM_RESULT. No forks.
 trimmed_mean() {
     local sum=0 lo=999999 hi=0 v
@@ -458,12 +452,16 @@ trimmed_mean() {
     fi
 }
 
-# Pure-bash /proc/stat reader; sets SNAPSHOT. No forks.
+# Pure-bash /proc/stat reader; sets SNAPSHOT.
 read_core_snapshot() {
     local line
     SNAPSHOT=""
     while read -r line; do
         case "$line" in
+            cpu\ ) # Aggregate line (cpu with space)
+                set -- $line
+                SNAPSHOT+="$(( $2+$3+$4+$5+$6+$7+$8+$9 )) $(( $5+$6 )) "
+                ;;
             cpu[0-9]*)
                 set -- $line
                 SNAPSHOT+="$(( $2+$3+$4+$5+$6+$7+$8+$9 )) $(( $5+$6 )) "
@@ -474,7 +472,7 @@ read_core_snapshot() {
 
 get_max_cpu_usage() {
     local previous=$1 current
-    local peak=0 t1=0 t2=0 t3=0 t4=0
+    local peak=0 total_pct=0 breadth=0
     local i n td id busy pct
     local -a pts cts
 
@@ -484,10 +482,21 @@ get_max_cpu_usage() {
     read -r -a pts <<< "$previous"
     read -r -a cts <<< "$current"
 
-    n=$(( ${#cts[@]} / 2 ))
+    # First pair in array is aggregate 'cpu' line
+    if (( ${#pts[@]} >= 2 && ${#cts[@]} >= 2 )); then
+        td=$(( ${cts[0]} - ${pts[0]} ))
+        id=$(( ${cts[1]} - ${pts[1]} ))
+        if (( td > 0 )); then
+            busy=$((td - id))
+            (( busy < 0 )) && busy=0
+            total_pct=$(( busy * 100 / td ))
+        fi
+    fi
 
-    if (( ${#pts[@]} == ${#cts[@]} && n > 0 )); then
-        for ((i=0; i<n; i++)); do
+    # Rest are per-core (start at 1 to skip aggregate)
+    n=$(( ${#cts[@]} / 2 ))
+    if (( ${#pts[@]} == ${#cts[@]} && n > 1 )); then
+        for ((i=1; i<n; i++)); do
             td=$(( ${cts[i*2]} - ${pts[i*2]} ))
             id=$(( ${cts[i*2+1]} - ${pts[i*2+1]} ))
             (( td <= 0 )) && continue
@@ -495,16 +504,13 @@ get_max_cpu_usage() {
             (( busy < 0 )) && busy=0
             pct=$(( busy * 100 / td ))
             (( pct > peak )) && peak=$pct
-            if (( pct >= t1 )); then t4=$t3; t3=$t2; t2=$t1; t1=$pct
-            elif (( pct >= t2 )); then t4=$t3; t3=$t2; t2=$pct
-            elif (( pct >= t3 )); then t4=$t3; t3=$pct
-            elif (( pct >= t4 )); then t4=$pct
-            fi
+            (( pct >= 40 )) && breadth=$((breadth + 1))
         done
     fi
 
-    CUR_TOP4=$(( (t1 + t2 + t3 + t4) / 4 ))
+    CUR_TOTAL=$total_pct
     CUR_PEAK=$peak
+    CUR_BREADTH=$breadth
     CUR_SNAPSHOT=$current
 }
 
@@ -1226,7 +1232,7 @@ monitor_and_adjust() {
     local fps_active=0          # Sticky flag: once active, stay active
     local fps_fail_count=0      # Track consecutive read failures
     local -a fps_history=()     # Buffer for averaging
-    local FPS_AVG_SIZE=4        # Average over ~4 cycles (12-16 seconds)
+    local FPS_AVG_SIZE=6        # Average over ~6 cycles (12-16 seconds)
     local probe_down_counter=0
     local PROBE_DOWN_INTERVAL=10  # ~30-40 seconds (10 cycles)
 
@@ -1345,7 +1351,7 @@ monitor_and_adjust() {
                 # Read failed — use sticky logic
                 (( fps_fail_count++ ))
                 
-                if (( fps_active == 1 && fps_fail_count < 5 )); then
+                if (( fps_active == 1 && fps_fail_count < 10 )); then
                     # Keep using last known FPS
                     current_fps=$last_valid_fps
                     use_fps_controller=1
@@ -1381,20 +1387,18 @@ monitor_and_adjust() {
 
             # Dynamic weighting: multicore workloads care about top4,
             # single-thread workloads care about peak (for boost ceiling)
-            local peak_w top4_w
+            local peak_w total_w
             if (( CUR_BREADTH >= 4 )); then
-                # Heavy multicore (emulation): top4 is 80% of signal
-                top4_w=4; peak_w=1
+                # Heavy multicore (emulation): total is 80% of signal
+                total_w=4; peak_w=1
             elif (( CUR_BREADTH >= 2 )); then
                 # Moderate multicore: 60/40 split
-                top4_w=3; peak_w=2
+                total_w=3; peak_w=2
             else
-                # Single core dominant: peak is 60% — but it's likely already
-                # at boost ceiling, so this just keeps us from under-responding
-                top4_w=2; peak_w=3
+                # Single core dominant: peak is 60%
+                total_w=2; peak_w=3
             fi
-            sig=$(( (CUR_TOP4 * top4_w + CUR_PEAK * peak_w) / (top4_w + peak_w) ))
-            
+            sig=$(( (CUR_TOTAL * total_w + CUR_PEAK * peak_w) / (total_w + peak_w) ))
             sig_samples+=( "$sig" )
             (( sig > max_sig )) && max_sig=$sig
             get_max_gpu_usage
@@ -1457,8 +1461,7 @@ monitor_and_adjust() {
             target_tdp=$base_target
         fi
 
-        (( target_tdp > ceiling )) && target_tdp=$ceiling
-        (( target_tdp < MIN_TDP )) && target_tdp=$MIN_TDP
+        
 
         # --- FPS Controller Override ---
         if (( use_fps_controller == 1 )); then
@@ -1496,6 +1499,9 @@ monitor_and_adjust() {
         fi
         # ------------------------------
 
+        (( target_tdp > ceiling )) && target_tdp=$ceiling
+        (( target_tdp < MIN_TDP )) && target_tdp=$MIN_TDP
+
         # Round to nearest watt: sub-0.5W down, 0.5W+ up
         target_tdp=$(( (target_tdp + STEP_TDP * 3 / 4) / STEP_TDP * STEP_TDP ))
         (( target_tdp < MIN_TDP )) && target_tdp=$MIN_TDP
@@ -1521,7 +1527,7 @@ monitor_and_adjust() {
         prev_usage=$load
     done
 }
-
+-
 # Function to handle script exit
 cleanup() {
     if (( SKIP_CLEANUP == 1 )); then
