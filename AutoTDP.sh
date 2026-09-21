@@ -40,6 +40,7 @@ TEST_MODE=0
 ACTION="run"
 EXIT_STATUS=0
 MONITOR_PID=0
+STEAMUI_WATCHER_PID=0
 declare -a CLI_OVERRIDES=()
 declare -a GAME_COMMAND=()
 
@@ -1139,6 +1140,36 @@ determine_tdp() {
     echo $(( (tdp / STEP_TDP) * STEP_TDP ))
 }
 
+watch_steamui() {
+    local HANG_THRESHOLD=95
+    local HANG_DURATION=10
+
+    log "Steam UI watcher started"
+    while true; do
+        # Sum the total CPU time (in seconds) of all steamwebhelper processes
+        local cpu1 cpu2
+        cpu1=$(ps -eo cputime,comm | awk '/steamwebhelper/ {print $1}' | awk -F: '{ if (NF==3) s+=$1*3600+$2*60+$3; else if (NF==2) s+=$1*60+$2; else s+=$1 } END {print s}')
+        
+        sleep "$HANG_DURATION"
+        
+        cpu2=$(ps -eo cputime,comm | awk '/steamwebhelper/ {print $1}' | awk -F: '{ if (NF==3) s+=$1*3600+$2*60+$3; else if (NF==2) s+=$1*60+$2; else s+=$1 } END {print s}')
+
+        [[ -z "$cpu2" || -z "$cpu1" ]] && continue
+
+        local diff avg_cpu
+        diff=$((cpu2 - cpu1))
+        # Calculate average CPU % over the duration
+        avg_cpu=$(( (diff * 100) / HANG_DURATION ))
+
+        if (( avg_cpu >= HANG_THRESHOLD )); then
+            log "steamwebhelper hung at ${avg_cpu}% CPU for ${HANG_DURATION}s. Killing..."
+            pkill -9 -f "steamwebhelper"
+        fi
+
+        sleep 5
+    done
+}
+
 # Function to monitor and adjust TDP based on CPU/GPU usage
 monitor_and_adjust() {
     local last_adjustment=0
@@ -1365,6 +1396,10 @@ cleanup() {
     if (( MONITOR_PID > 0 )); then
         kill "$MONITOR_PID" > /dev/null 2>&1 || true
         wait "$MONITOR_PID" 2> /dev/null || true
+    fi
+
+    if (( STEAMUI_WATCHER_PID > 0 )); then
+        kill "$STEAMUI_WATCHER_PID" > /dev/null 2>&1 || true
     fi
 
     set_tdp "$ACTIVE_DEFAULT_TDP"
@@ -1954,6 +1989,10 @@ fi
 
 # Start monitoring and adjusting TDP
 log "Running with profile=$DEVICE_PROFILE mode=$PERFORMANCE_MODE max_tdp=$ACTIVE_MAX_TDP battery_max_tdp=$ACTIVE_BATTERY_MAX_TDP"
+
+# Start the Steam UI crash watcher in the background
+watch_steamui &
+STEAMUI_WATCHER_PID=$!
 
 if (( ${#GAME_COMMAND[@]} > 0 )); then
     run_wrapped_command
