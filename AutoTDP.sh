@@ -1527,7 +1527,7 @@ monitor_and_adjust() {
         prev_usage=$load
     done
 }
--
+
 # Function to handle script exit
 cleanup() {
     if (( SKIP_CLEANUP == 1 )); then
