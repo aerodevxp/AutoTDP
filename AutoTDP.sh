@@ -791,7 +791,8 @@ detect_steam_appid_from_processes() {
     for pid_path in /proc/[0-9]*; do
         pid=${pid_path##*/}
         [[ -r "/proc/$pid/environ" ]] || continue
-        env_data=$(tr '\0' '\n' < "/proc/$pid/environ" 2> /dev/null)
+        env_data=$(cat "/proc/$pid/environ" 2>/dev/null | tr '\0' '\n')
+        [[ -z "$env_data" ]] && continue
 
         for key in SteamAppId SteamGameId STEAM_COMPAT_APP_ID; do
             candidate=$(printf '%s\n' "$env_data" | awk -F= -v k="$key" '$1 == k {print $2; exit}')
@@ -828,8 +829,19 @@ get_steam_fps_limit() {
         return 1 # No limit
     fi
 
-    # Get the limit
+    # Get the limit for this app
     limit=$(sed -n '/"AppTargetFrameRate"/,/}/p' "$config_file" | grep "\"$appid\"" | awk '{print $2}' | tr -d '"')
+    
+    # If no per-game limit, fall back to the global default (AppID 3582452512)
+    if [[ -z "$limit" ]]; then
+        # Check if global default has frame limit disabled
+        disabled=$(sed -n '/"DisableFrameLimit"/,/}/p' "$config_file" | grep "\"3582452512\"" | awk '{print $2}' | tr -d '"')
+        if [[ "$disabled" == "1" ]]; then
+            return 1
+        fi
+        limit=$(sed -n '/"AppTargetFrameRate"/,/}/p' "$config_file" | grep "\"3582452512\"" | awk '{print $2}' | tr -d '"')
+    fi
+
     if [[ -n "$limit" ]]; then
         echo "$limit"
         return 0
@@ -837,7 +849,6 @@ get_steam_fps_limit() {
 
     return 1
 }
-
 get_gamescope_fps() {
     local pipe fps_data fps
     for pipe in /run/user/*/gamescope.*/stats.pipe; do
@@ -894,14 +905,11 @@ detect_executable_from_wrapped_command() {
 }
 
 detect_executable_from_processes() {
-    local pid
-    local cmdline
-    local candidate
-
+    local pid cmdline candidate
     for pid_path in /proc/[0-9]*; do
         pid=${pid_path##*/}
         [[ -r "/proc/$pid/cmdline" ]] || continue
-        cmdline=$(tr '\0' '\n' < "/proc/$pid/cmdline" 2> /dev/null)
+        cmdline=$(cat "/proc/$pid/cmdline" 2>/dev/null | tr '\0' '\n')
         [[ -n "$cmdline" ]] || continue
 
         candidate=$(extract_executable_from_cmdline "$cmdline")
@@ -910,18 +918,16 @@ detect_executable_from_processes() {
             return 0
         fi
     done
-
     return 1
 }
 
 detect_launcher_type() {
-    local pid
-    local comm
-
+    local pid comm
     for pid_path in /proc/[0-9]*; do
         pid=${pid_path##*/}
         [[ -r "/proc/$pid/comm" ]] || continue
-        read -r comm < "/proc/$pid/comm" || continue
+        comm=$(cat "/proc/$pid/comm" 2>/dev/null)
+        [[ -z "$comm" ]] && continue
         comm=$(printf '%s' "$comm" | tr '[:upper:]' '[:lower:]')
 
         case "$comm" in
@@ -935,7 +941,6 @@ detect_launcher_type() {
                 ;;
         esac
     done
-
     return 1
 }
 
