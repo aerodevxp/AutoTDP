@@ -1336,8 +1336,8 @@ monitor_and_adjust() {
         trimmed_mean "${sig_samples[@]}"; cpu_signal=$TM_RESULT
         trimmed_mean "${gpu_samples[@]}"; gpu_usage=$TM_RESULT
 
-        # The bottleneck sets the load: whichever of CPU or GPU is higher
-        if (( gpu_usage > cpu_signal )); then
+        # The bottleneck sets the load: GPU, but only if CPU isn't being used by 50% more
+        if (( gpu_usage > cpu_signal/1.5 )); then
             load=$gpu_usage
         else
             load=$cpu_signal
