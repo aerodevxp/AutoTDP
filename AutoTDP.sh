@@ -357,13 +357,21 @@ set_tdp() {
     if (( value < BASE_MIN_TDP )); then
         value=$BASE_MIN_TDP
     fi
-    if run_privileged "$RYZENADJ_EXEC" --stapm-limit "$value" --fast-limit "$value" --slow-limit "$value"; then
+    if run_privileged "$RYZENADJ_EXEC" --stapm-limit "$value" --fast-limit "$value" --slow-limit "$value" > /dev/null 2>&1; then
         TDP_LOG="ryzenadj ${value}mW"
     else
         TDP_LOG="ryzenadj FAILED ${value}mW"
     fi
 }
 
+# Silent TDP re-assert (no logging, used to fight external tools)
+assert_tdp() {
+    local value=$1
+    if (( value < BASE_MIN_TDP )); then
+        value=$BASE_MIN_TDP
+    fi
+    run_privileged "$RYZENADJ_EXEC" --stapm-limit "$value" --fast-limit "$value" --slow-limit "$value" > /dev/null 2>&1
+}
 # Set ACPI platform profile to match TDP range (fan curves, voltage, etc.)
 set_platform_profile() {
     local tdp_w=$(($1 / 1000))
@@ -1209,6 +1217,7 @@ monitor_and_adjust() {
 
     local target_fps=0
     local current_fps=0
+    local last_valid_fps=0
     local fps_appid=""
     local use_fps_controller=0
     local prev_usage=0
@@ -1307,14 +1316,15 @@ monitor_and_adjust() {
 
         # Get current FPS if we have a target
         if [[ -n "$target_fps" && "$target_fps" -gt 0 ]]; then
-            current_fps=$(get_gamescope_fps || true)
+            local raw_fps
+            raw_fps=$(get_gamescope_fps || true)
             
-            if [[ -n "$current_fps" && "$current_fps" -gt 0 ]]; then
+            if [[ -n "$raw_fps" && "$raw_fps" -gt 0 ]]; then
                 # Normalize FPS (handle doubled/tripled values)
-                current_fps=$(normalize_fps "$current_fps" "$target_fps")
+                raw_fps=$(normalize_fps "$raw_fps" "$target_fps")
                 
                 # Add to history buffer
-                fps_history+=("$current_fps")
+                fps_history+=("$raw_fps")
                 (( ${#fps_history[@]} > FPS_AVG_SIZE )) && fps_history=("${fps_history[@]:1}")
                 
                 # Calculate average FPS from buffer
@@ -1323,6 +1333,7 @@ monitor_and_adjust() {
                     (( fps_sum += f ))
                 done
                 current_fps=$(( fps_sum / ${#fps_history[@]} ))
+                last_valid_fps=$current_fps  # Save valid FPS
                 
                 # Activate sticky controller
                 fps_active=1
@@ -1333,7 +1344,8 @@ monitor_and_adjust() {
                 (( fps_fail_count++ ))
                 
                 if (( fps_active == 1 && fps_fail_count < 5 )); then
-                    # Keep using last known FPS, don't fall back to load logic
+                    # Keep using last known FPS
+                    current_fps=$last_valid_fps
                     use_fps_controller=1
                 else
                     # Too many failures, deactivate
@@ -1415,9 +1427,9 @@ monitor_and_adjust() {
             log "CPU: ${cpu_signal}% (spike ${max_sig}%) | GPU: ${gpu_usage}% | load: ${load}% (fulltdp@${eff_full}%) | TDP: $((current_tdp / 1000))W"
         fi
 
-        # Re-assert limits occasionally in case the EC resets them
-        if (( EPOCHSECONDS - last_adjustment > 300 )); then
-            set_tdp "$current_tdp"
+        # Re-assert limits every 15s in case the EC or another tool resets them
+        if (( EPOCHSECONDS - last_adjustment > 15 )); then
+            assert_tdp "$current_tdp"
             last_adjustment=$EPOCHSECONDS
         fi
 
