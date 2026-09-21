@@ -435,46 +435,6 @@ read_core_snapshot() {
 }
 
 
-# Computes the busiest single core's busy percentage against the previous snapshot.
-get_max_cpu_usage() {
-    local previous=$1 current
-    local peak=0 t1=0 t2=0 t3=0 t4=0 breadth=0
-    local i n td id busy pct
-    local -a pts cts
-
-    read_core_snapshot
-    current=$SNAPSHOT
-
-    read -r -a pts <<< "$previous"
-    read -r -a cts <<< "$current"
-
-    n=$(( ${#cts[@]} / 2 ))
-
-    if (( ${#pts[@]} == ${#cts[@]} && n > 0 )); then
-        for ((i=0; i<n; i++)); do
-            td=$(( ${cts[i*2]} - ${pts[i*2]} ))
-            id=$(( ${cts[i*2+1]} - ${pts[i*2+1]} ))
-            (( td <= 0 )) && continue
-            busy=$((td - id))
-            (( busy < 0 )) && busy=0
-            pct=$(( busy * 100 / td ))
-            (( pct > peak )) && peak=$pct
-            (( pct >= 40 )) && breadth=$((breadth + 1))
-            if (( pct >= t1 )); then t4=$t3; t3=$t2; t2=$t1; t1=$pct
-            elif (( pct >= t2 )); then t4=$t3; t3=$t2; t2=$pct
-            elif (( pct >= t3 )); then t4=$t3; t3=$pct
-            elif (( pct >= t4 )); then t4=$pct
-            fi
-        done
-    fi
-
-    CUR_TOP4=$(( (t1 + t2 + t3 + t4) / 4 ))
-    CUR_PEAK=$peak
-    CUR_BREADTH=$breadth
-    CUR_SNAPSHOT=$current
-}
-
-
 # Trimmed mean of args (drops high and low); sets TM_RESULT. No forks.
 trimmed_mean() {
     local sum=0 lo=999999 hi=0 v
@@ -827,21 +787,68 @@ detect_steam_appid_from_environment() {
 }
 
 detect_steam_appid_from_processes() {
-    return 1
-    local pid env_data
+    local pid env_data candidate
     for pid_path in /proc/[0-9]*; do
         pid=${pid_path##*/}
         [[ -r "/proc/$pid/environ" ]] || continue
         env_data=$(tr '\0' '\n' < "/proc/$pid/environ" 2> /dev/null)
 
         for key in SteamAppId SteamGameId STEAM_COMPAT_APP_ID; do
-            local candidate
             candidate=$(printf '%s\n' "$env_data" | awk -F= -v k="$key" '$1 == k {print $2; exit}')
             if [[ -n "$candidate" && "$candidate" != "0" ]]; then
                 printf '%s\n' "$candidate"
                 return 0
             fi
         done
+    done
+    return 1
+}
+
+get_steam_user_id() {
+    local config_file
+    config_file=$(ls /home/*/.local/share/Steam/userdata/*/config/localconfig.vdf 2>/dev/null | head -1)
+    if [[ -n "$config_file" ]]; then
+        echo "$config_file" | awk -F/ '{print $(NF-2)}'
+        return 0
+    fi
+    return 1
+}
+
+get_steam_fps_limit() {
+    local appid=$1
+    local config_file user_id disabled limit
+
+    user_id=$(get_steam_user_id) || return 1
+    config_file=$(ls /home/*/.local/share/Steam/userdata/$user_id/config/localconfig.vdf 2>/dev/null | head -1)
+    [[ -z "$config_file" ]] && return 1
+
+    # Check if frame limit is disabled for this app
+    disabled=$(sed -n '/"DisableFrameLimit"/,/}/p' "$config_file" | grep "\"$appid\"" | awk '{print $2}' | tr -d '"')
+    if [[ "$disabled" == "1" ]]; then
+        return 1 # No limit
+    fi
+
+    # Get the limit
+    limit=$(sed -n '/"AppTargetFrameRate"/,/}/p' "$config_file" | grep "\"$appid\"" | awk '{print $2}' | tr -d '"')
+    if [[ -n "$limit" ]]; then
+        echo "$limit"
+        return 0
+    fi
+
+    return 1
+}
+
+get_gamescope_fps() {
+    local pipe fps_data fps
+    for pipe in /run/user/*/gamescope.*/stats.pipe; do
+        [[ -p "$pipe" ]] || continue
+        # Read for 0.5s, extract max fps (which is usually the cap if hit)
+        fps_data=$(timeout 0.5 cat "$pipe" 2>/dev/null)
+        [[ -z "$fps_data" ]] && continue
+        fps=$(echo "$fps_data" | awk -F= '/^fps=/ {if ($2 > max) max=$2} END {if (max != "") printf "%d", max + 0.5}')
+        [[ -z "$fps" ]] && continue
+        echo "$fps"
+        return 0
     done
     return 1
 }
@@ -1182,6 +1189,11 @@ monitor_and_adjust() {
     local new_power_state
     local ceiling
 
+    local target_fps=0
+    local current_fps=0
+    local fps_appid=""
+    local use_fps_controller=0
+
     # Proportional mapping: load% maps linearly onto MIN..ceiling.
     # 90% load = full ceiling, 45% = halfway, below scales toward MIN.
     local FULL_SCALE=90
@@ -1258,6 +1270,26 @@ monitor_and_adjust() {
         cycle=$((cycle + 1))
         if (( cycle % 5 == 1 )); then
             resolve_active_game_profile
+            
+            # Check for Steam FPS limit
+            fps_appid=$(detect_steam_appid_from_processes || true)
+            if [[ -n "$fps_appid" ]]; then
+                target_fps=$(get_steam_fps_limit "$fps_appid" || true)
+            else
+                target_fps=0
+            fi
+        fi
+
+        # Get current FPS if we have a target
+        if [[ -n "$target_fps" && "$target_fps" -gt 0 ]]; then
+            current_fps=$(get_gamescope_fps || true)
+            if [[ -n "$current_fps" && "$current_fps" -gt 0 ]]; then
+                use_fps_controller=1
+            else
+                use_fps_controller=0
+            fi
+        else
+            use_fps_controller=0
         fi
 
         # Periodic update check
@@ -1323,7 +1355,11 @@ monitor_and_adjust() {
             last_spike=$EPOCHSECONDS
         fi
 
-        log "CPU: ${cpu_signal}% (spike ${max_sig}%) | GPU: ${gpu_usage}% | load: ${load}% (fulltdp@${eff_full}%) | TDP: $((current_tdp / 1000))W"
+        if (( use_fps_controller == 1 )); then
+            log "FPS: ${current_fps}/${target_fps} | CPU: ${cpu_signal}% | GPU: ${gpu_usage}% | TDP: $((current_tdp / 1000))W"
+        else
+            log "CPU: ${cpu_signal}% (spike ${max_sig}%) | GPU: ${gpu_usage}% | load: ${load}% (fulltdp@${eff_full}%) | TDP: $((current_tdp / 1000))W"
+        fi
 
         # Re-assert limits occasionally in case the EC resets them
         if (( EPOCHSECONDS - last_adjustment > 300 )); then
@@ -1356,13 +1392,29 @@ monitor_and_adjust() {
         (( target_tdp > ceiling )) && target_tdp=$ceiling
         (( target_tdp < MIN_TDP )) && target_tdp=$MIN_TDP
 
+        # --- FPS Controller Override ---
+        if (( use_fps_controller == 1 )); then
+            
+            if (( current_fps < target_fps - 5 )); then
+                # Struggling: ramp up aggressively
+                target_tdp=$(( current_tdp + 2 * STEP_TDP ))
+            elif (( current_fps >= target_fps - 2 )); then
+                # Hitting cap: try to save power by dropping 1W
+                target_tdp=$(( current_tdp - STEP_TDP ))
+            else
+                # Close to target: hold steady
+                target_tdp=$current_tdp
+            fi
+        fi
+        # ------------------------------
+
         # Round to nearest watt: sub-0.5W down, 0.5W+ up
         target_tdp=$(( (target_tdp + STEP_TDP * 3 / 4) / STEP_TDP * STEP_TDP ))
         (( target_tdp < MIN_TDP )) && target_tdp=$MIN_TDP
 
-        # Up: jump straight to target. Down: at most 2W per write.
+        # Up: jump straight to target. Down: at most 3W per write.
         if (( target_tdp < current_tdp )); then
-            (( current_tdp - target_tdp > 2 * STEP_TDP )) && target_tdp=$(( current_tdp - 2 * STEP_TDP ))
+            (( current_tdp - target_tdp > 3 * STEP_TDP )) && target_tdp=$(( current_tdp - 3 * STEP_TDP ))
         fi
 
         # Deadband: ignore sub-0.5W churn
