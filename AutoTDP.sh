@@ -1140,6 +1140,7 @@ determine_tdp() {
     echo $(( (tdp / STEP_TDP) * STEP_TDP ))
 }
 
+# You have to work on this TODO - CPU isnt a good way to identify a crash because of downloads
 watch_steamui() {
     local HANG_THRESHOLD=98
     local HANG_DURATION=10
@@ -2010,8 +2011,8 @@ fi
 log "Running with profile=$DEVICE_PROFILE mode=$PERFORMANCE_MODE max_tdp=$ACTIVE_MAX_TDP battery_max_tdp=$ACTIVE_BATTERY_MAX_TDP"
 
 # Start the Steam UI crash watcher in the background
-watch_steamui &
-STEAMUI_WATCHER_PID=$!
+#watch_steamui &
+#STEAMUI_WATCHER_PID=$!
 
 if (( ${#GAME_COMMAND[@]} > 0 )); then
     run_wrapped_command
