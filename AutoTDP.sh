@@ -819,77 +819,6 @@ detect_steam_appid_from_processes() {
     return 1
 }
 
-get_steam_user_id() {
-    local config_file
-    config_file=$(ls /home/*/.local/share/Steam/userdata/*/config/localconfig.vdf 2>/dev/null | head -1)
-    if [[ -n "$config_file" ]]; then
-        echo "$config_file" | awk -F/ '{print $(NF-2)}'
-        return 0
-    fi
-    return 1
-}
-
-get_steam_fps_limit() {
-    local appid=$1
-    local config_file user_id disabled limit
-    user_id=$(get_steam_user_id) || return 1
-    config_file=$(ls /home/*/.local/share/Steam/userdata/$user_id/config/localconfig.vdf 2>/dev/null | head -1)
-    [[ -z "$config_file" ]] && return 1
-    disabled=$(sed -n '/"DisableFrameLimit"/,/}/p' "$config_file" | grep "\"$appid\"" | awk '{print $2}' | tr -d '"')
-    if [[ "$disabled" == "1" ]]; then return 1; fi
-    limit=$(sed -n '/"AppTargetFrameRate"/,/}/p' "$config_file" | grep "\"$appid\"" | awk '{print $2}' | tr -d '"')
-    if [[ -z "$limit" ]]; then
-        disabled=$(sed -n '/"DisableFrameLimit"/,/}/p' "$config_file" | grep "\"3582452512\"" | awk '{print $2}' | tr -d '"')
-        if [[ "$disabled" == "1" ]]; then return 1; fi
-        limit=$(sed -n '/"AppTargetFrameRate"/,/}/p' "$config_file" | grep "\"3582452512\"" | awk '{print $2}' | tr -d '"')
-    fi
-    if [[ -n "$limit" ]]; then echo "$limit"; return 0; fi
-    return 1
-}
-
-get_gamescope_fps() {
-    local pipe fps
-    for pipe in /run/user/*/gamescope.*/stats.pipe; do
-        [[ -p "$pipe" ]] || continue
-        
-        fps=$(
-            exec 3< "$pipe"
-            last_fps=""
-            while read -t 2 -r line <&3; do
-                if [[ "$line" =~ ^fps= ]]; then
-                    last_fps="${line#fps=}"
-                fi
-            done
-            exec 3<&-
-            if [[ -n "$last_fps" ]]; then
-                printf "%d" "${last_fps%.*}"
-            fi
-        )
-        
-        if [[ -n "$fps" && "$fps" -gt 0 ]]; then
-            echo "$fps"
-            return 0
-        fi
-    done
-    return 1
-}
-normalize_fps() {
-    local raw_fps=$1
-    local target_fps=$2
-    local factor
-    
-    # If raw FPS is more than 10 over target, it might be multiplied by display refresh
-    if (( raw_fps > target_fps + 10 )); then
-        # Calculate factor: how many times target fits into raw (rounded)
-        factor=$(( (raw_fps + target_fps / 2) / target_fps ))
-        (( factor < 1 )) && factor=1
-        echo $(( raw_fps / factor ))
-        return 0
-    fi
-    
-    echo "$raw_fps"
-}
-
 
 normalize_executable_name() {
     local value=$1
@@ -1221,21 +1150,6 @@ monitor_and_adjust() {
     local new_power_state
     local ceiling
 
-    local target_fps=0
-    local current_fps=0
-    local last_valid_fps=0
-    local fps_appid=""
-    local use_fps_controller=0
-    local prev_usage=0
-    local fps_settled=0
-    local was_decreasing=0
-    local fps_active=0          # Sticky flag: once active, stay active
-    local fps_fail_count=0      # Track consecutive read failures
-    local -a fps_history=()     # Buffer for averaging
-    local FPS_AVG_SIZE=6        # Average over ~6 cycles (12-16 seconds)
-    local probe_down_counter=0
-    local PROBE_DOWN_INTERVAL=10  # ~30-40 seconds (10 cycles)
-
     # Proportional mapping: load% maps linearly onto MIN..ceiling.
     # 90% load = full ceiling, 45% = halfway, below scales toward MIN.
     local FULL_SCALE=90
@@ -1251,8 +1165,6 @@ monitor_and_adjust() {
     local base_target target_tdp diff
     local -a sig_samples=()
     local -a gpu_samples=()
-
-
 
     get_max_cpu_usage ""
     prev_snapshot=$CUR_SNAPSHOT
@@ -1312,59 +1224,18 @@ monitor_and_adjust() {
         cycle=$((cycle + 1))
         if (( cycle % 5 == 1 )); then
             resolve_active_game_profile
-            
-            # Check for Steam FPS limit
-            fps_appid=$(detect_steam_appid_from_processes || true)
-            if [[ -n "$fps_appid" ]]; then
-                target_fps=$(get_steam_fps_limit "$fps_appid" || true)
-            else
-                target_fps=0
-            fi
         fi
 
-        # Get current FPS if we have a target
-        if [[ -n "$target_fps" && "$target_fps" -gt 0 ]]; then
-            local raw_fps
-            raw_fps=$(get_gamescope_fps || true)
-            
-            if [[ -n "$raw_fps" && "$raw_fps" -gt 0 ]]; then
-                # Normalize FPS (handle doubled/tripled values)
-                raw_fps=$(normalize_fps "$raw_fps" "$target_fps")
-                
-                # Add to history buffer
-                fps_history+=("$raw_fps")
-                (( ${#fps_history[@]} > FPS_AVG_SIZE )) && fps_history=("${fps_history[@]:1}")
-                
-                # Calculate average FPS from buffer
-                local fps_sum=0
-                for f in "${fps_history[@]}"; do
-                    (( fps_sum += f ))
-                done
-                current_fps=$(( fps_sum / ${#fps_history[@]} ))
-                last_valid_fps=$current_fps  # Save valid FPS
-                
-                # Activate sticky controller
-                fps_active=1
-                fps_fail_count=0
-                use_fps_controller=1
-            else
-                # Read failed — use sticky logic
-                (( fps_fail_count++ ))
-                
-                if (( fps_active == 1 && fps_fail_count < 10 )); then
-                    # Keep using last known FPS
-                    current_fps=$last_valid_fps
-                    use_fps_controller=1
-                else
-                    # Too many failures, deactivate
-                    fps_active=0
-                    use_fps_controller=0
-                fi
+        # Periodic update check
+        if (( EPOCHSECONDS - last_update_check >= UPDATE_CHECK_INTERVAL )); then
+            last_update_check=$EPOCHSECONDS
+            if download_file "$UPDATE_URL" /tmp/autotdp_check.sh 2>/dev/null \
+                && ! cmp -s /tmp/autotdp_check.sh "$SCRIPT_DEST"; then
+                log "Update available upstream - run: $0 --update"
             fi
-        else
-            use_fps_controller=0
-            fps_active=0
+            rm -f /tmp/autotdp_check.sh
         fi
+
 
         # Periodic update check
         if (( EPOCHSECONDS - last_update_check >= UPDATE_CHECK_INTERVAL )); then
@@ -1385,18 +1256,12 @@ monitor_and_adjust() {
             get_max_cpu_usage "$prev_snapshot"
             prev_snapshot=$CUR_SNAPSHOT
 
-            # Dynamic weighting: multicore workloads care about top4,
-            # single-thread workloads care about peak (for boost ceiling)
+            
             local peak_w total_w
-            if (( CUR_BREADTH >= 4 )); then
-                # Heavy multicore (emulation): total is 80% of signal
-                total_w=4; peak_w=1
-            elif (( CUR_BREADTH >= 2 )); then
-                # Moderate multicore: 60/40 split
-                total_w=3; peak_w=2
+            if (( CUR_PEAK > 50 )); then
+                total_w=2; peak_w=1
             else
-                # Single core dominant: peak is 60%
-                total_w=2; peak_w=3
+                total_w=1; peak_w=0
             fi
             sig=$(( (CUR_TOTAL * total_w + CUR_PEAK * peak_w) / (total_w + peak_w) ))
             sig_samples+=( "$sig" )
@@ -1422,15 +1287,16 @@ monitor_and_adjust() {
             smooth_load=$(( (smooth_load + load) / 2 ))
         fi
 
-        # Spike activity refreshes the bonus window
         if (( max_sig >= SPIKE_THRESHOLD)); then
             last_spike=$EPOCHSECONDS
         fi
 
-        if (( use_fps_controller == 1 )); then
-            log "FPS: ${current_fps}/${target_fps} | CPU: ${cpu_signal}% | GPU: ${gpu_usage}% | TDP: $((current_tdp / 1000))W"
-        else
-            log "CPU: ${cpu_signal}% (spike ${max_sig}%) | GPU: ${gpu_usage}% | load: ${load}% (fulltdp@${eff_full}%) | TDP: $((current_tdp / 1000))W"
+        log "CPU: ${cpu_signal}% (spike ${max_sig}%) | GPU: ${gpu_usage}% | load: ${load}% (fulltdp@${eff_full}%) | TDP: $((current_tdp / 1000))W"
+
+        # Re-assert limits every 15s in case the EC or another tool resets them
+        if (( EPOCHSECONDS - last_adjustment > 15 )); then
+            assert_tdp "$current_tdp"
+            last_adjustment=$EPOCHSECONDS
         fi
 
         # Re-assert limits every 15s in case the EC or another tool resets them
@@ -1460,37 +1326,6 @@ monitor_and_adjust() {
         else
             target_tdp=$base_target
         fi
-
-        # --- FPS Controller Override ---
-        if (( use_fps_controller == 1 )); then
-            local avg_fps=$current_fps
-            
-            # Target is okay if within 1 FPS of target
-            local fps_ok=0
-            if (( avg_fps >= target_fps - 1 )); then
-                fps_ok=1
-            fi
-            
-            if (( avg_fps < target_fps - 1 )); then
-                # FPS is too low: go up 1W immediately
-                target_tdp=$(( current_tdp + STEP_TDP ))
-                was_decreasing=0
-            elif (( fps_ok == 1 )); then
-                # FPS is fine. Let the usage formula pull TDP down to save power,
-                # but don't let it push TDP up if we're already hitting the cap efficiently.
-                if (( base_target < current_tdp )); then
-                    target_tdp=$base_target
-                else
-                    target_tdp=$current_tdp
-                fi
-                was_decreasing=0
-            else
-                # FPS is above target (e.g., 65/60). Hold steady.
-                target_tdp=$current_tdp
-                was_decreasing=0
-            fi
-        fi
-        # ------------------------------
 
         (( target_tdp > ceiling )) && target_tdp=$ceiling
         (( target_tdp < MIN_TDP )) && target_tdp=$MIN_TDP
