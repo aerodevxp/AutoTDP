@@ -1461,8 +1461,6 @@ monitor_and_adjust() {
             target_tdp=$base_target
         fi
 
-        
-
         # --- FPS Controller Override ---
         if (( use_fps_controller == 1 )); then
             local avg_fps=$current_fps
@@ -1478,19 +1476,14 @@ monitor_and_adjust() {
                 target_tdp=$(( current_tdp + STEP_TDP ))
                 was_decreasing=0
             elif (( fps_ok == 1 )); then
-                if (( was_decreasing == 1 )); then
-                    # We just decreased TDP last cycle.
-                    # Since FPS is still okay, we successfully found a lower state!
-                    target_tdp=$current_tdp
-                    was_decreasing=0
-                elif (( prev_usage > 0 && load <= prev_usage * 9 / 10 )); then
-                    # Hardware load dropped by 10%+: safely go down 1W
-                    target_tdp=$(( current_tdp - STEP_TDP ))
-                    was_decreasing=1
+                # FPS is fine. Let the usage formula pull TDP down to save power,
+                # but don't let it push TDP up if we're already hitting the cap efficiently.
+                if (( base_target < current_tdp )); then
+                    target_tdp=$base_target
                 else
-                    # Load is steady, hold TDP to protect physics-based games
                     target_tdp=$current_tdp
                 fi
+                was_decreasing=0
             else
                 # FPS is above target (e.g., 65/60). Hold steady.
                 target_tdp=$current_tdp
