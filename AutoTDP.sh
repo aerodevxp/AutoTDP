@@ -381,13 +381,27 @@ set_tdp() {
 }
 
 # Silent TDP re-assert (no logging, used to fight external tools)
+# Silent TDP re-assert (no logging, used to fight external tools)
 assert_tdp() {
     local value=$1
     if (( value < BASE_MIN_TDP )); then
         value=$BASE_MIN_TDP
     fi
-    run_privileged "$RYZENADJ_EXEC" --stapm-limit "$value" --fast-limit "$value" --slow-limit "$value" > /dev/null 2>&1
+
+    local slow_offset=$(( value * 20 / 100 ))
+    (( slow_offset < 2000 )) && slow_offset=2000
+    local fast_offset=$(( value * 40 / 100 ))
+    (( fast_offset < 3000 )) && fast_offset=3000
+
+    local slow_limit=$(( value + slow_offset ))
+    local fast_limit=$(( value + fast_offset ))
+
+    run_privileged "$RYZENADJ_EXEC" \
+        --stapm-limit "$value" \
+        --fast-limit "$fast_limit" \
+        --slow-limit "$slow_limit" > /dev/null 2>&1
 }
+
 # Set ACPI platform profile to match TDP range (fan curves, voltage, etc.)
 set_platform_profile() {
     local tdp_w=$(($1 / 1000))
@@ -1302,17 +1316,6 @@ monitor_and_adjust() {
             rm -f /tmp/autotdp_check.sh
         fi
 
-
-        # Periodic update check
-        if (( EPOCHSECONDS - last_update_check >= UPDATE_CHECK_INTERVAL )); then
-            last_update_check=$EPOCHSECONDS
-            if download_file "$UPDATE_URL" /tmp/autotdp_check.sh 2>/dev/null \
-                && ! cmp -s /tmp/autotdp_check.sh "$SCRIPT_DEST"; then
-                log "Update available upstream - run: $0 --update"
-            fi
-            rm -f /tmp/autotdp_check.sh
-        fi
-
         # Sub-sample the interval; trimmed mean filters momentary spikes
         sig_samples=()
         gpu_samples=()
@@ -1358,12 +1361,6 @@ monitor_and_adjust() {
         fi
 
         log "CPU: ${cpu_signal}% (spike ${max_sig}%) | GPU: ${gpu_usage}% | load: ${load}% (fulltdp@${eff_full}%) | TDP: $((current_tdp / 1000))W"
-
-        # Re-assert limits every 15s in case the EC or another tool resets them
-        if (( EPOCHSECONDS - last_adjustment > 15 )); then
-            assert_tdp "$current_tdp"
-            last_adjustment=$EPOCHSECONDS
-        fi
 
         # Re-assert limits every 15s in case the EC or another tool resets them
         if (( EPOCHSECONDS - last_adjustment > 15 )); then
