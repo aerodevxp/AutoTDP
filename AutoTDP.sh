@@ -358,8 +358,23 @@ set_tdp() {
     if (( value < BASE_MIN_TDP )); then
         value=$BASE_MIN_TDP
     fi
-    if run_privileged "$RYZENADJ_EXEC" --stapm-limit "$value" --fast-limit "$value" --slow-limit "$value" > /dev/null 2>&1; then
-        TDP_LOG="ryzenadj ${value}mW"
+
+    # Scale fast/slow limits proportionally based on base TDP
+    # Uses 20% for slow, 40% for fast (matches AMD factory offsets or so i think)
+    local slow_offset=$(( value * 20 / 100 ))
+    (( slow_offset < 2000 )) && slow_offset=2000  # Min +2W
+    
+    local fast_offset=$(( value * 40 / 100 ))
+    (( fast_offset < 3000 )) && fast_offset=3000  # Min +3W
+
+    local slow_limit=$(( value + slow_offset ))
+    local fast_limit=$(( value + fast_offset ))
+
+    if run_privileged "$RYZENADJ_EXEC" \
+        --stapm-limit "$value" \
+        --fast-limit "$fast_limit" \
+        --slow-limit "$slow_limit"; then
+        TDP_LOG="ryzenadj ${value}mW (fast ${fast_limit} slow ${slow_limit})"
     else
         TDP_LOG="ryzenadj FAILED ${value}mW"
     fi
