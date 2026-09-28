@@ -454,14 +454,16 @@ set_platform_profile() {
     fi
 }
 
-# Enable MCU powersave for suspend power savings
+# MCU powersave for suspend power savings
 set_mcu_powersave() {
     local path
     for path in "${MCU_POWERSAVE_PATHS[@]}"; do
         if [[ -w "$path" ]]; then
             #it looks like it's breaking SMU control on awake, but im unsure
-            if printf '1' > "$path" 2>/dev/null; then
-                log "MCU powersave enabled via $path"
+            # echo "auto" > /sys/class/drm/card0/device/power_dpm_force_performance_level
+            # on resume could fix it. TODO
+            if printf '0' > "$path" 2>/dev/null; then
+                log "MCU powersave disabled via $path. This avoid wake-from-suspend issues."
                 return 0
             fi
         fi
