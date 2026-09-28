@@ -367,8 +367,10 @@ set_tdp() {
     local fast_offset=$(( value * 40 / 100 ))
     (( fast_offset < 3000 )) && fast_offset=3000  # Min +3W
 
-    local slow_limit=$(( value + slow_offset ))
-    local fast_limit=$(( value + fast_offset ))
+    #local slow_limit=$(( value + slow_offset ))
+    #local fast_limit=$(( value + fast_offset ))
+    local slow_limit=$(( value ))
+    local fast_limit=$(( value ))
 
     if run_privileged "$RYZENADJ_EXEC" \
         --stapm-limit "$value" \
