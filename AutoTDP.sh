@@ -363,7 +363,7 @@ set_tdp() {
     # Uses 20% for slow, 40% for fast (matches AMD factory offsets or so i think)
     local slow_offset=$(( value * 20 / 100 ))
     (( slow_offset < 2000 )) && slow_offset=2000  # Min +2W
-    
+
     local fast_offset=$(( value * 40 / 100 ))
     (( fast_offset < 3000 )) && fast_offset=3000  # Min +3W
 
@@ -383,20 +383,14 @@ set_tdp() {
 }
 
 # Silent TDP re-assert (no logging, used to fight external tools)
-# Silent TDP re-assert (no logging, used to fight external tools)
 assert_tdp() {
     local value=$1
     if (( value < BASE_MIN_TDP )); then
         value=$BASE_MIN_TDP
     fi
 
-    local slow_offset=$(( value * 20 / 100 ))
-    (( slow_offset < 2000 )) && slow_offset=2000
-    local fast_offset=$(( value * 40 / 100 ))
-    (( fast_offset < 3000 )) && fast_offset=3000
-
-    local slow_limit=$(( value + slow_offset ))
-    local fast_limit=$(( value + fast_offset ))
+    local slow_limit=$(( value ))
+    local fast_limit=$(( value ))
 
     run_privileged "$RYZENADJ_EXEC" \
         --stapm-limit "$value" \
@@ -1179,13 +1173,13 @@ watch_steamui() {
     local HANG_DURATION=10
 
     log "Steam UI watcher started"
-    
+
     # Associative arrays to store CPU times per PID
     declare -A cpu_start
 
     while true; do
         cpu_start=()
-        
+
         # Snapshot 1: Get all steamwebhelper PIDs and their CPU time
         while read -r pid cputime; do
             [[ -z "$pid" ]] && continue
@@ -1207,7 +1201,7 @@ watch_steamui() {
             [[ -z "$cputime" ]] && continue
 
             sec=$(echo "$cputime" | awk -F: '{ if (NF==3) print $1*3600+$2*60+$3; else if (NF==2) print $1*60+$2; else print $1 }')
-            
+
             diff=$((sec - ${cpu_start[$pid]}))
             avg_cpu=$(( (diff * 100) / HANG_DURATION ))
 
@@ -1329,7 +1323,7 @@ monitor_and_adjust() {
             get_max_cpu_usage "$prev_snapshot"
             prev_snapshot=$CUR_SNAPSHOT
 
-            
+
             local peak_w total_w
             if (( CUR_PEAK > 50 )); then
                 total_w=2; peak_w=1
